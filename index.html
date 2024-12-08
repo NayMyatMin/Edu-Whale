@@ -4,17 +4,62 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Edu-Whale Educational Consultancy</title>
+    
+    <!-- Meta Description for SEO -->
+    <meta name="description" content="Edu-Whale Educational Consultancy connects Myanmar students with quality educational opportunities abroad, providing personalized support and guidance.">
+    
+    <!-- Meta Keywords for SEO -->
+    <meta name="keywords" content="Educational Consultancy, Study Abroad, Student Recruitment, Student Counseling, Myanmar Education">
+    
+    <!-- Author Meta Tag -->
+    <meta name="author" content="Edu-Whale Educational Consultancy">
+    
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Roboto&display=swap" rel="stylesheet">
+    
+    <!-- Normalize CSS -->
     <link rel="stylesheet" href="normalize.css">
+    
+    <!-- Custom Stylesheet -->
     <link rel="stylesheet" href="style.css">
+    
+    <!-- Structured Data for SEO -->
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "EducationalOrganization",
+        "name": "Edu-Whale Educational Consultancy",
+        "url": "https://www.eduwhale.info",
+        "logo": "https://www.eduwhale.info/logo.png",
+        "contactPoint": {
+            "@type": "ContactPoint",
+            "telephone": "+959426043676",
+            "contactType": "Customer Service",
+            "email": "support@eduwhale.info"
+        },
+        "address": {
+            "@type": "PostalAddress",
+            "streetAddress": "Your Street Address",
+            "addressLocality": "Yangon",
+            "addressCountry": "Myanmar"
+        }
+    }
+    </script>
 </head>
 <body>
-    <!-- Header Section -->
+    <!-- Skip Navigation Link for Accessibility -->
+    <a href="#main-content" class="skip-link">Skip to main content</a>
+    
+    <!-- Header Section with Background Image -->
     <header class="cover-container">
-        <img src="cover.png" alt="Edu-Whale Cover Photo">
+        <!-- Content can be added here if needed, such as a tagline -->
+        <!-- <div class="header-content">
+            <h1>Empowering Your Educational Journey</h1>
+        </div> -->
     </header>
 
     <!-- Navigation -->
-    <nav>
+    <nav aria-label="Main Navigation">
         <ul>
             <li><a href="#about">About Us</a></li>
             <li><a href="#services">Services</a></li>
@@ -22,44 +67,61 @@
         </ul>
     </nav>
 
-    <!-- About Us Section -->
-    <section id="about" class="container">
-        <h2>
-            <img src="logo.png" alt="Edu-Whale Logo" class="about-logo">
-            About Us
-        </h2>
-        <p>
-            Edu-Whale Educational Consultancy Services is dedicated to empowering Myanmar students 
-            by connecting them with quality educational opportunities abroad. We provide tailored 
-            support in securing placements at esteemed institutions and guiding students every step 
-            of the way.
-        </p>
-    </section>
+    <!-- Main Content -->
+    <main id="main-content">
+        <!-- About Us Section -->
+        <section id="about" class="container">
+            <h2>
+                <img src="logo.png" alt="Edu-Whale Logo" class="about-logo">
+                About Us
+            </h2>
+            <p>
+                Edu-Whale Educational Consultancy Services is dedicated to empowering Myanmar students 
+                by connecting them with quality educational opportunities abroad. We provide tailored 
+                support in securing placements at esteemed institutions and guiding students every step 
+                of the way.
+            </p>
+        </section>
 
-    <!-- Services Section -->
-    <section id="services" class="container">
-        <h2>Our Services</h2>
-        <div class="service">
-            <h3>Student Recruitment</h3>
-            <p>Personalized academic and career guidance, application assistance, and more.</p>
-        </div>
-        <div class="service">
-            <h3>Student Counseling</h3>
-            <p>Visa and immigration support, accommodation arrangements, and pre-departure guidance.</p>
-        </div>
-        <div class="service">
-            <h3>Institutional Partnerships</h3>
-            <p>Collaboration with universities to create tailored admission pathways.</p>
-        </div>
-    </section>
+        <!-- Services Section -->
+        <section id="services" class="container">
+            <h2>Our Services</h2>
+            <div class="service">
+                <h3>Student Recruitment</h3>
+                <p>Personalized academic and career guidance, application assistance, and more.</p>
+            </div>
+            <div class="service">
+                <h3>Student Counseling</h3>
+                <p>Visa and immigration support, accommodation arrangements, and pre-departure guidance.</p>
+            </div>
+            <div class="service">
+                <h3>Institutional Partnerships</h3>
+                <p>Collaboration with universities to create tailored admission pathways.</p>
+            </div>
+        </section>
 
-    <!-- Contact Us Section -->
-    <section id="contact" class="container">
-        <h2>Contact Us</h2>
-        <p>Email: <a href="mailto:support@eduwhale.info">support@eduwhale.info</a></p>
-        <p>Phone: +959426043676</p>
-        <p>Address: Yangon, Myanmar</p>
-    </section>
+        <!-- Contact Us Section -->
+        <section id="contact" class="container">
+            <h2>Contact Us</h2>
+            <p>Email: <a href="mailto:support@eduwhale.info">support@eduwhale.info</a></p>
+            <p>Phone: +959426043676</p>
+            <p>Address: Yangon, Myanmar</p>
+            
+            <!-- Contact Form -->
+            <form action="/submit-form" method="POST" aria-label="Contact Form">
+                <label for="name">Name:</label>
+                <input type="text" id="name" name="name" required>
+
+                <label for="email">Email:</label>
+                <input type="email" id="email" name="email" required>
+
+                <label for="message">Message:</label>
+                <textarea id="message" name="message" required></textarea>
+
+                <button type="submit">Send Message</button>
+            </form>
+        </section>
+    </main>
 
     <!-- Footer -->
     <footer>
