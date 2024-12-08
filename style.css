@@ -11,14 +11,14 @@ body {
 /* Header Cover Photo */
 .cover-container {
     position: relative;
-    height: 70vh; /* Adjust height as needed */
+    height: 70vh; /* Adjust height for responsiveness */
     overflow: hidden;
 }
 
 .cover-container img {
     width: 100%;
     height: 100%;
-    object-fit: cover; /* Ensures the image covers the entire area */
+    object-fit: cover; /* Makes the image responsive */
     position: absolute;
     top: 0;
     left: 0;
@@ -33,6 +33,7 @@ nav {
 
 nav ul {
     display: flex;
+    flex-wrap: wrap; /* Wraps items on smaller screens */
     justify-content: center;
     list-style: none;
     padding: 0;
@@ -79,10 +80,10 @@ h2 {
 
 /* About Section Logo */
 .about-logo {
-    width: 100px; /* Adjust size as needed */
+    width: 60px;
     height: auto;
-    vertical-align: middle; /* Align with the heading */
-    margin-right: 0.5rem; /* Add space between logo and text */
+    vertical-align: middle;
+    margin-right: 0.5rem;
     display: inline-block;
 }
 
@@ -111,4 +112,38 @@ footer {
 footer p {
     margin: 0;
     font-size: 0.9rem;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    nav ul {
+        flex-direction: column;
+        align-items: center;
+    }
+
+    .container {
+        padding: 1rem;
+    }
+
+    .about-logo {
+        width: 40px;
+    }
+
+    h2 {
+        font-size: 1.5rem;
+    }
+
+    section {
+        padding: 1rem;
+    }
+}
+
+@media (min-width: 769px) and (max-width: 1024px) {
+    .about-logo {
+        width: 50px;
+    }
+
+    h2 {
+        font-size: 1.8rem;
+    }
 }
