@@ -5,13 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Edu-Whale Educational Consultancy</title>
     
-    <!-- Meta Description for SEO -->
+    <!-- Meta Tags for SEO -->
     <meta name="description" content="Edu-Whale Educational Consultancy connects Myanmar students with quality educational opportunities abroad, providing personalized support and guidance.">
-    
-    <!-- Meta Keywords for SEO -->
     <meta name="keywords" content="Educational Consultancy, Study Abroad, Student Recruitment, Student Counseling, Myanmar Education">
-    
-    <!-- Author Meta Tag -->
     <meta name="author" content="Edu-Whale Educational Consultancy">
     
     <!-- Google Fonts -->
@@ -47,24 +43,32 @@
     </script>
 </head>
 <body>
-    <!-- Skip Navigation Link for Accessibility -->
-    <!-- <a href="#main-content" class="skip-link">Skip to main content</a> -->
-    
-    <!-- Header Section with Background Image -->
+    <!-- Header Section with Flexbox -->
     <header class="cover-container">
-        <!-- Content can be added here if needed, such as a tagline -->
+        <img src="cover.png" alt="Edu-Whale Cover Photo" class="cover-image" loading="lazy">
         <!-- <div class="header-content">
             <h1>Empowering Your Educational Journey</h1>
         </div> -->
     </header>
 
     <!-- Navigation -->
-    <nav aria-label="Main Navigation">
-        <ul>
-            <li><a href="#about">About Us</a></li>
-            <li><a href="#services">Services</a></li>
-            <li><a href="#contact">Contact Us</a></li>
-        </ul>
+    <nav class="navbar" aria-label="Main Navigation">
+        <div class="nav-container">
+            <a href="#" class="nav-logo">
+                <img src="logo.png" alt="Edu-Whale Logo" class="nav-logo-img">
+            </a>             
+            <b>Edu-Whale</b>
+            <ul class="nav-menu">
+                <li class="nav-item"><a href="#about" class="nav-link">About Us</a></li>
+                <li class="nav-item"><a href="#services" class="nav-link">Services</a></li>
+                <li class="nav-item"><a href="#contact" class="nav-link">Contact Us</a></li>
+            </ul>
+            <div class="nav-toggle" id="mobile-menu">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+            </div>
+        </div>
     </nav>
 
     <!-- Main Content -->
@@ -73,7 +77,7 @@
         <section id="about" class="container">
             <h2>
                 <img src="logo.png" alt="Edu-Whale Logo" class="about-logo">
-                Edu-Whale
+                About Us
             </h2>
             <p>
                 Edu-Whale Educational Consultancy Services is dedicated to empowering Myanmar students 
@@ -86,37 +90,47 @@
         <!-- Services Section -->
         <section id="services" class="container">
             <h2>Our Services</h2>
-            <div class="service">
-                <h3>Student Recruitment</h3>
-                <p>Personalized academic and career guidance, application assistance, and more.</p>
-            </div>
-            <div class="service">
-                <h3>Student Counseling</h3>
-                <p>Visa and immigration support, accommodation arrangements, and pre-departure guidance.</p>
-            </div>
-            <div class="service">
-                <h3>Institutional Partnerships</h3>
-                <p>Collaboration with universities to create tailored admission pathways.</p>
+            <div class="services-grid">
+                <div class="service">
+                    <h3>Student Recruitment</h3>
+                    <p>Personalized academic and career guidance, application assistance, and more.</p>
+                </div>
+                <div class="service">
+                    <h3>Student Counseling</h3>
+                    <p>Visa and immigration support, accommodation arrangements, and pre-departure guidance.</p>
+                </div>
+                <div class="service">
+                    <h3>Institutional Partnerships</h3>
+                    <p>Collaboration with universities to create tailored admission pathways.</p>
+                </div>
             </div>
         </section>
 
         <!-- Contact Us Section -->
         <section id="contact" class="container">
             <h2>Contact Us</h2>
-            <p>Email: <a href="mailto:support@eduwhale.info">support@eduwhale.info</a></p>
-            <p>Phone: +959426043676</p>
-            <p>Address: Yangon, Myanmar</p>
+            <div class="contact-info">
+                <p>Email: <a href="mailto:support@eduwhale.info">support@eduwhale.info</a></p>
+                <p>Phone: +959426043676</p>
+                <p>Address: Yangon, Myanmar</p>
+            </div>
             
             <!-- Contact Form -->
             <form action="/submit-form" method="POST" aria-label="Contact Form">
-                <label for="name">Name:</label>
-                <input type="text" id="name" name="name" required>
+                <div class="form-group">
+                    <label for="name">Name:</label>
+                    <input type="text" id="name" name="name" required>
+                </div>
 
-                <label for="email">Email:</label>
-                <input type="email" id="email" name="email" required>
+                <div class="form-group">
+                    <label for="email">Email:</label>
+                    <input type="email" id="email" name="email" required>
+                </div>
 
-                <label for="message">Message:</label>
-                <textarea id="message" name="message" required></textarea>
+                <div class="form-group">
+                    <label for="message">Message:</label>
+                    <textarea id="message" name="message" required></textarea>
+                </div>
 
                 <button type="submit">Send Message</button>
             </form>
@@ -129,5 +143,16 @@
             <p>&copy; 2024 Edu-Whale Educational Consultancy Services. All Rights Reserved.</p>
         </div>
     </footer>
+
+    <!-- JavaScript for Mobile Menu Toggle -->
+    <script>
+        const mobileMenu = document.getElementById('mobile-menu');
+        const navMenu = document.querySelector('.nav-menu');
+
+        mobileMenu.addEventListener('click', () => {
+            mobileMenu.classList.toggle('is-active');
+            navMenu.classList.toggle('active');
+        });
+    </script>
 </body>
 </html>
