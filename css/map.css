@@ -915,3 +915,17 @@
     transition: none !important;
   }
 }
+
+/* Burmese popups are wider and taller than English ones: keep them inside a
+   phone-width map (Leaflet's maxWidth is 300px; the map is ~310px wide at a
+   375px viewport) and let long popups scroll instead of being cut off. */
+:lang(my) .ymap .leaflet-popup-content {
+  max-width: min(300px, calc(100vw - 160px));
+  max-height: min(46vh, 360px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+:lang(my) .ymap-pop {
+  line-height: 1.7;
+}
