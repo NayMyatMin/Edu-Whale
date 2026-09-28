@@ -1,0 +1,917 @@
+/* Interactive storm map (js/map.js). All selectors are prefixed "ymap-" and
+   all colours come from the --ymap-* tokens below, so the map follows the
+   light / dark theme with the same scoping rules as the rest of the site. */
+
+:root {
+  --ymap-surface: #fcfcfb;
+  --ymap-surface-2: #f1f0ec;
+  --ymap-ink: #0b0b0b;
+  --ymap-ink-2: #52514e;
+  --ymap-muted: #6f6d68;
+  --ymap-border: rgba(11, 11, 11, 0.1);
+  --ymap-border-strong: rgba(11, 11, 11, 0.24);
+  --ymap-accent: #1c5cab;
+  --ymap-accent-soft: rgba(28, 92, 171, 0.1);
+  --ymap-on-accent: #ffffff;
+  --ymap-shadow: 0 1px 2px rgba(11, 11, 11, 0.12), 0 2px 8px rgba(11, 11, 11, 0.08);
+  --ymap-bg: #dfe3e3; /* shown while tiles load */
+  --ymap-base-filter: none;
+  --ymap-attr-bg: rgba(252, 252, 251, 0.88);
+
+  /* storm overlays */
+  --ymap-track: #0b0b0b;
+  --ymap-track-casing: rgba(252, 252, 251, 0.9);
+  --ymap-ring: #3f3e3b;
+  --ymap-ring-label-bg: rgba(252, 252, 251, 0.9);
+  --ymap-cone: #52514e;
+  --ymap-cone-line: #0b0b0b;
+  --ymap-wind-60: #fab219;
+  --ymap-wind-90: #ec835a;
+  --ymap-wind-120: #d03b3b;
+  --ymap-tcfa: #c2410c;
+  --ymap-invest: #1c5cab;
+  --ymap-home: #1c5cab;
+  --ymap-home-ink: #ffffff;
+  --ymap-dmh-bg: #0b0b0b;
+  --ymap-dmh-ink: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ymap-surface: #1a1a19;
+    --ymap-surface-2: #242422;
+    --ymap-ink: #ffffff;
+    --ymap-ink-2: #c3c2b7;
+    --ymap-muted: #9a988f;
+    --ymap-border: rgba(255, 255, 255, 0.1);
+    --ymap-border-strong: rgba(255, 255, 255, 0.24);
+    --ymap-accent: #86b6ef;
+    --ymap-accent-soft: rgba(134, 182, 239, 0.14);
+    --ymap-on-accent: #0d0d0d;
+    --ymap-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 2px 10px rgba(0, 0, 0, 0.35);
+    --ymap-bg: #1c2226;
+    --ymap-base-filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.88) saturate(0.55);
+    --ymap-attr-bg: rgba(26, 26, 25, 0.88);
+
+    --ymap-track: #ffffff;
+    --ymap-track-casing: rgba(13, 13, 13, 0.85);
+    --ymap-ring: #d6d5cc;
+    --ymap-ring-label-bg: rgba(26, 26, 25, 0.88);
+    --ymap-cone: #c3c2b7;
+    --ymap-cone-line: #ffffff;
+    --ymap-tcfa: #f97316;
+    --ymap-invest: #86b6ef;
+    --ymap-home: #86b6ef;
+    --ymap-home-ink: #0d0d0d;
+    --ymap-dmh-bg: #ffffff;
+    --ymap-dmh-ink: #0b0b0b;
+  }
+}
+
+:root[data-theme="dark"] {
+  --ymap-surface: #1a1a19;
+  --ymap-surface-2: #242422;
+  --ymap-ink: #ffffff;
+  --ymap-ink-2: #c3c2b7;
+  --ymap-muted: #9a988f;
+  --ymap-border: rgba(255, 255, 255, 0.1);
+  --ymap-border-strong: rgba(255, 255, 255, 0.24);
+  --ymap-accent: #86b6ef;
+  --ymap-accent-soft: rgba(134, 182, 239, 0.14);
+  --ymap-on-accent: #0d0d0d;
+  --ymap-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 2px 10px rgba(0, 0, 0, 0.35);
+  --ymap-bg: #1c2226;
+  --ymap-base-filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.88) saturate(0.55);
+  --ymap-attr-bg: rgba(26, 26, 25, 0.88);
+
+  --ymap-track: #ffffff;
+  --ymap-track-casing: rgba(13, 13, 13, 0.85);
+  --ymap-ring: #d6d5cc;
+  --ymap-ring-label-bg: rgba(26, 26, 25, 0.88);
+  --ymap-cone: #c3c2b7;
+  --ymap-cone-line: #ffffff;
+  --ymap-tcfa: #f97316;
+  --ymap-invest: #86b6ef;
+  --ymap-home: #86b6ef;
+  --ymap-home-ink: #0d0d0d;
+  --ymap-dmh-bg: #ffffff;
+  --ymap-dmh-ink: #0b0b0b;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Control bar                                                              */
+/* ------------------------------------------------------------------------ */
+
+.ymap-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0 0 10px;
+  color: var(--ymap-ink);
+}
+
+.ymap-bar [hidden],
+.ymap[hidden],
+.ymap-windy[hidden] {
+  display: none !important;
+}
+
+.ymap-maponly {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ymap-tabs {
+  display: inline-flex;
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 3px;
+  gap: 2px;
+  border: 1px solid var(--ymap-border-strong);
+  border-radius: 12px;
+  background: var(--ymap-surface-2);
+}
+
+.ymap-tab {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ymap-ink-2);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ymap-tab[aria-selected="true"] {
+  background: var(--ymap-surface);
+  color: var(--ymap-ink);
+  box-shadow: var(--ymap-shadow);
+}
+
+.ymap-layers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ymap-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 14px 0 10px;
+  border: 1px solid var(--ymap-border-strong);
+  border-radius: 999px;
+  background: var(--ymap-surface);
+  color: var(--ymap-ink);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.ymap-toggle[aria-pressed="true"] {
+  border-color: var(--ymap-accent);
+  background: var(--ymap-accent-soft);
+}
+
+.ymap-toggle-box {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 1.5px solid var(--ymap-muted);
+  border-radius: 6px;
+  background: var(--ymap-surface);
+  color: var(--ymap-on-accent);
+}
+
+.ymap-toggle-box svg {
+  width: 14px;
+  height: 14px;
+  visibility: hidden;
+}
+
+.ymap-toggle[aria-pressed="true"] .ymap-toggle-box {
+  border-color: var(--ymap-accent);
+  background: var(--ymap-accent);
+}
+
+.ymap-toggle[aria-pressed="true"] .ymap-toggle-box svg {
+  visibility: visible;
+}
+
+.ymap-toggle-icon,
+.ymap-play-icon {
+  display: inline-flex;
+  flex: none;
+}
+
+.ymap-toggle-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.ymap-satrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.ymap-play {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 16px 0 12px;
+  border: 1px solid var(--ymap-accent);
+  border-radius: 999px;
+  background: var(--ymap-accent);
+  color: var(--ymap-on-accent);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ymap-play svg {
+  width: 18px;
+  height: 18px;
+}
+
+.ymap-play:disabled {
+  border-color: var(--ymap-border-strong);
+  background: var(--ymap-surface-2);
+  color: var(--ymap-muted);
+  cursor: not-allowed;
+}
+
+.ymap-play[aria-busy="true"] {
+  opacity: 0.75;
+}
+
+.ymap-slider {
+  flex: 1 1 160px;
+  min-width: 140px;
+  height: 44px;
+  margin: 0;
+  accent-color: var(--ymap-accent);
+  cursor: pointer;
+}
+
+.ymap-slider:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.ymap-sattime,
+.ymap-radartime,
+.ymap-hint,
+.ymap-status {
+  margin: 0;
+  color: var(--ymap-ink-2);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.ymap-sattime {
+  flex: 1 1 100%;
+}
+
+.ymap-hint {
+  color: var(--ymap-muted);
+}
+
+.ymap-status:empty {
+  display: none;
+}
+
+.ymap-tab:focus-visible,
+.ymap-toggle:focus-visible,
+.ymap-play:focus-visible,
+.ymap-slider:focus-visible,
+.ymap-legend-summary:focus-visible {
+  outline: 3px solid var(--ymap-accent);
+  outline-offset: 2px;
+}
+
+@media (min-width: 720px) {
+  .ymap-sattime {
+    flex: 0 1 auto;
+  }
+}
+
+/* Phones: two even columns of switches; the decorative layer icons go. */
+@media (max-width: 519px) {
+  .ymap-layers {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .ymap-toggle {
+    padding: 4px 10px 4px 8px;
+    border-radius: 14px;
+    text-align: start;
+  }
+
+  .ymap-toggle-icon {
+    display: none;
+  }
+}
+
+/* Legend ------------------------------------------------------------------ */
+
+.ymap-legend {
+  border: 1px solid var(--ymap-border);
+  border-radius: 12px;
+  background: var(--ymap-surface);
+}
+
+.ymap-legend-summary {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 14px;
+  border-radius: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ymap-legend-body {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px 24px;
+  padding: 4px 14px 14px;
+}
+
+.ymap-lg-section {
+  min-width: 0;
+}
+
+.ymap-lg-wide {
+  grid-column: 1 / -1;
+}
+
+.ymap-lg-title {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ymap-ink);
+}
+
+.ymap-lg-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ymap-lg-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--ymap-ink-2);
+}
+
+.ymap-lg-sw {
+  display: inline-flex;
+  flex: none;
+  justify-content: center;
+  min-width: 44px;
+}
+
+.ymap-lg-text,
+.ymap-lg-note {
+  margin: 0 0 8px;
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--ymap-ink-2);
+}
+
+.ymap-lg-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--ymap-muted);
+}
+
+.ymap-lg-imgwrap {
+  display: inline-block;
+  max-width: 100%;
+  padding: 6px;
+  border-radius: 8px;
+  background: #ffffff; /* the GIBS scale image is drawn for a white page */
+}
+
+.ymap-lg-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.ymap-sw-casing {
+  stroke: var(--ymap-track-casing);
+}
+
+.ymap-sw-track {
+  stroke: var(--ymap-track);
+}
+
+.ymap-pt-swatch {
+  stroke: var(--ymap-surface);
+}
+
+.ymap-sw-cone {
+  fill: var(--ymap-cone);
+  fill-opacity: 0.18;
+  stroke: var(--ymap-cone-line);
+}
+
+.ymap-sw-tcfa {
+  fill: var(--ymap-tcfa);
+  fill-opacity: 0.2;
+  stroke: var(--ymap-tcfa);
+}
+
+.ymap-sw-invest {
+  fill: var(--ymap-invest);
+  fill-opacity: 0.08;
+  stroke: var(--ymap-invest);
+}
+
+.ymap-sw-ring {
+  fill: none;
+  stroke: var(--ymap-ring);
+}
+
+.ymap-sw-wind-60 {
+  fill: var(--ymap-wind-60);
+  fill-opacity: 0.3;
+  stroke: var(--ymap-wind-60);
+}
+
+.ymap-sw-wind-90 {
+  fill: var(--ymap-wind-90);
+  fill-opacity: 0.4;
+  stroke: var(--ymap-wind-90);
+}
+
+.ymap-sw-wind-120 {
+  fill: var(--ymap-wind-120);
+  fill-opacity: 0.5;
+  stroke: var(--ymap-wind-120);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Map container and Leaflet chrome                                         */
+/* ------------------------------------------------------------------------ */
+
+.ymap,
+.ymap-windy-wrap {
+  position: relative;
+  width: 100%;
+  height: 62vh;
+  height: 62svh;
+  min-height: 320px;
+  max-height: 640px;
+  border: 1px solid var(--ymap-border);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.ymap.leaflet-container {
+  background: var(--ymap-bg);
+  color: var(--ymap-ink);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.ymap.leaflet-container:focus-visible {
+  outline: 3px solid var(--ymap-accent);
+  outline-offset: 2px;
+}
+
+.ymap .leaflet-ymap-base-pane {
+  filter: var(--ymap-base-filter);
+}
+
+.ymap .leaflet-bar {
+  border: 1px solid var(--ymap-border-strong);
+  border-radius: 10px;
+  box-shadow: var(--ymap-shadow);
+  overflow: hidden;
+}
+
+.ymap .leaflet-bar a,
+.ymap .leaflet-bar a:hover {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  line-height: 44px;
+  border-bottom-color: var(--ymap-border);
+  background: var(--ymap-surface);
+  color: var(--ymap-ink);
+  font-size: 22px;
+}
+
+.ymap .leaflet-bar a:hover {
+  background: var(--ymap-surface-2);
+}
+
+.ymap .leaflet-bar a.leaflet-disabled {
+  background: var(--ymap-surface-2);
+  color: var(--ymap-muted);
+}
+
+.ymap .leaflet-bar a:focus-visible {
+  outline: 3px solid var(--ymap-accent);
+  outline-offset: -3px;
+}
+
+.ymap .ymap-fit svg {
+  width: 22px;
+  height: 22px;
+}
+
+.ymap .leaflet-control-attribution {
+  max-width: calc(100% - 16px);
+  padding: 2px 6px;
+  border-top-left-radius: 6px;
+  background: var(--ymap-attr-bg);
+  color: var(--ymap-ink-2);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.ymap .leaflet-control-attribution a {
+  color: var(--ymap-accent);
+}
+
+/* Popups and tooltips */
+.ymap .leaflet-popup-content-wrapper,
+.ymap .leaflet-popup-tip {
+  background: var(--ymap-surface);
+  color: var(--ymap-ink);
+  box-shadow: var(--ymap-shadow);
+}
+
+.ymap .leaflet-popup-content-wrapper {
+  border: 1px solid var(--ymap-border);
+  border-radius: 12px;
+}
+
+.ymap .leaflet-popup-content {
+  margin: 12px 44px 12px 16px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.ymap .leaflet-container a.leaflet-popup-close-button,
+.ymap a.leaflet-popup-close-button {
+  width: 44px;
+  height: 44px;
+  font: 24px/44px system-ui, sans-serif;
+  color: var(--ymap-ink-2);
+}
+
+.ymap-pop-title {
+  margin: 0 0 2px;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.ymap-pop-sub {
+  margin: 0 0 8px;
+  color: var(--ymap-ink-2);
+}
+
+.ymap-pop-stage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.ymap-pop-swatch {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--ymap-border-strong);
+  border-radius: 3px;
+}
+
+.ymap-pop-list {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ymap-pop-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  color: var(--ymap-accent);
+  font-weight: 600;
+}
+
+.ymap .leaflet-tooltip.ymap-tip {
+  padding: 4px 8px;
+  border: 1px solid var(--ymap-border-strong);
+  border-radius: 8px;
+  background: var(--ymap-surface);
+  color: var(--ymap-ink);
+  box-shadow: var(--ymap-shadow);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.ymap .leaflet-tooltip-top.ymap-tip::before {
+  border-top-color: var(--ymap-surface);
+}
+
+.ymap .leaflet-tooltip-bottom.ymap-tip::before {
+  border-bottom-color: var(--ymap-surface);
+}
+
+.ymap .leaflet-tooltip-left.ymap-tip::before {
+  border-left-color: var(--ymap-surface);
+}
+
+.ymap .leaflet-tooltip-right.ymap-tip::before {
+  border-right-color: var(--ymap-surface);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Overlays (Leaflet SVG paths: CSS overrides the fallback attributes)       */
+/* ------------------------------------------------------------------------ */
+
+.ymap .ymap-track {
+  stroke: var(--ymap-track);
+}
+
+.ymap .ymap-track-casing {
+  stroke: var(--ymap-track-casing);
+}
+
+.ymap .ymap-pt {
+  stroke: var(--ymap-surface);
+}
+
+.ymap .ymap-ring {
+  stroke: var(--ymap-ring);
+}
+
+.ymap .ymap-cone {
+  stroke: var(--ymap-cone-line);
+  fill: var(--ymap-cone);
+}
+
+.ymap .ymap-wind-60 {
+  stroke: var(--ymap-wind-60);
+  fill: var(--ymap-wind-60);
+}
+
+.ymap .ymap-wind-90 {
+  stroke: var(--ymap-wind-90);
+  fill: var(--ymap-wind-90);
+}
+
+.ymap .ymap-wind-120 {
+  stroke: var(--ymap-wind-120);
+  fill: var(--ymap-wind-120);
+}
+
+.ymap .ymap-tcfa {
+  stroke: var(--ymap-tcfa);
+  fill: var(--ymap-tcfa);
+}
+
+.ymap .ymap-tcfa-axis {
+  stroke: var(--ymap-tcfa);
+  fill: none;
+}
+
+.ymap .ymap-invest {
+  stroke: var(--ymap-invest);
+  fill: var(--ymap-invest);
+}
+
+.ymap .ymap-sat-frame {
+  transition: opacity 0.3s ease;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Markers                                                                   */
+/* ------------------------------------------------------------------------ */
+
+.ymap .ymap-sys-icon,
+.ymap .ymap-home-icon,
+.ymap .ymap-dmh-icon,
+.ymap .ymap-ring-icon {
+  border: 0;
+  background: none;
+}
+
+.ymap .ymap-sys-icon:focus-visible,
+.ymap .ymap-dmh-icon:focus-visible {
+  outline: 3px solid var(--ymap-accent);
+  outline-offset: 2px;
+  border-radius: 50%;
+}
+
+.ymap-sys,
+.ymap-home,
+.ymap-dmh {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.ymap-glyph {
+  display: block;
+}
+
+.ymap-glyph-casing {
+  stroke: var(--ymap-surface);
+}
+
+.ymap-glyph-core {
+  stroke: var(--ymap-surface);
+}
+
+.ymap-label {
+  position: absolute;
+  top: 50%;
+  left: 100%;
+  margin-left: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--ymap-border-strong);
+  border-radius: 7px;
+  background: var(--ymap-surface);
+  color: var(--ymap-ink);
+  box-shadow: var(--ymap-shadow);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.ymap-home-pin {
+  display: block;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35));
+}
+
+.ymap-home-pin svg {
+  display: block;
+}
+
+.ymap-pin-body {
+  fill: var(--ymap-home);
+  stroke: var(--ymap-surface);
+}
+
+.ymap-pin-house {
+  fill: var(--ymap-home-ink);
+}
+
+/* Yangon's name sits above the pin: storms and the DMH position are usually
+   to the west, south or east, so this side collides least. */
+.ymap-home-label {
+  top: auto;
+  bottom: 100%;
+  left: 50%;
+  margin: 0 0 3px;
+  transform: translateX(-50%);
+}
+
+/* Near the right edge of the map, labels move to the left of their marker. */
+.ymap-flip .ymap-label {
+  right: 100%;
+  left: auto;
+  margin-right: 4px;
+  margin-left: 0;
+}
+
+.ymap-ring-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0 5px;
+  border-radius: 5px;
+  background: var(--ymap-ring-label-bg);
+  color: var(--ymap-ink-2);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  transform: translate(-50%, -50%);
+}
+
+.ymap-dmh-dot {
+  position: absolute;
+  inset: 2px;
+  border: 3px solid var(--ymap-dmh-bg);
+  border-radius: 50%;
+  background: var(--ymap-surface);
+  box-shadow: 0 0 0 2px var(--ymap-surface);
+}
+
+.ymap-dmh-badge {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 50%;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px 2px 4px;
+  border: 1px solid var(--ymap-surface);
+  border-radius: 6px;
+  background: var(--ymap-dmh-bg);
+  color: var(--ymap-dmh-ink);
+  box-shadow: var(--ymap-shadow);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.35;
+  white-space: nowrap;
+  transform: translateX(-50%);
+}
+
+.ymap-dmh-badge-static {
+  position: static;
+  transform: none;
+}
+
+.ymap-dmh-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--ymap-dmh-ink);
+  border-radius: 2px;
+  background: var(--ymap-muted);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Windy tab and fallbacks                                                   */
+/* ------------------------------------------------------------------------ */
+
+.ymap-windy-note {
+  margin: 0 0 8px;
+  color: var(--ymap-ink-2);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.ymap-windy-wrap {
+  background: var(--ymap-surface-2);
+}
+
+.ymap-windy-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.ymap-unavailable {
+  margin: 0;
+  padding: 16px;
+  color: var(--ymap-ink-2);
+}
+
+/* Burmese needs taller lines; never italic. */
+:lang(my) .ymap-bar,
+:lang(my) .ymap-pop,
+:lang(my) .ymap-label,
+:lang(my) .ymap-windy-note {
+  line-height: 1.85;
+}
+
+:lang(my) .ymap-toggle,
+:lang(my) .ymap-play {
+  line-height: 1.6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ymap .ymap-sat-frame,
+  .ymap .leaflet-tile {
+    transition: none !important;
+  }
+}

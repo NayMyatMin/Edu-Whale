@@ -1,0 +1,10 @@
+{
+  "_comment": "Hand-edited floor for the attention level, for when the automatic sources miss something (e.g. a DMH warning the feeds have not picked up). To use it: set enabled to true, minLevel to 1 (Monitor), 2 (Prepare) or 3 (Danger), expires to an ISO time such as 2026-10-01T09:00:00+06:30 (or null for no expiry - avoid), and write a short message in both languages. Commit to main; the site picks it up within about 10 minutes. It can only raise the level, never lower it. Set enabled back to false afterwards.",
+  "enabled": false,
+  "minLevel": 2,
+  "expires": null,
+  "message": {
+    "en": "Example: DMH has issued a storm warning that affects Yangon. Please follow DMH and the local authorities.",
+    "my": "ဥပမာ — မိုးဇလက ရန်ကုန်ကို ထိခိုက်နိုင်တဲ့ မုန်တိုင်းသတိပေးချက် ထုတ်ပြန်ထားပါတယ်။ မိုးဇလနဲ့ သက်ဆိုင်ရာ တာဝန်ရှိသူတွေရဲ့ ညွှန်ကြားချက်ကို လိုက်နာပါ။"
+  }
+}

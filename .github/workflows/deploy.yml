@@ -1,0 +1,109 @@
+# Builds and deploys the static site to GitHub Pages, refreshing the official
+# DMH bulletin data (data/dmh.json) on every run. DMH's website cannot be
+# read from the browser (no CORS), so this schedule is what keeps the
+# "Official DMH bulletin" section current.
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Every 30 minutes, off the busy :00/:30 marks (GitHub delays those most).
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check Pages setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.source.outputs.enabled }}
+    steps:
+      - name: Is Pages set to deploy from GitHub Actions?
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          build_type="$(gh api "repos/${REPO}/pages" --jq .build_type 2>/dev/null || true)"
+          if [ "$build_type" = "workflow" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            # A notice, not a failure: this runs every 30 minutes and must not
+            # send a failure email each time before Pages is configured.
+            echo "::notice title=Site not deployed::GitHub Pages is not set to deploy from GitHub Actions (current source: ${build_type:-none}). In the repository open Settings → Pages → Source: GitHub Actions. Until then this workflow skips fetching DMH data and deploying."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GitHub disables scheduled workflows after 60 days without repository
+      # activity; the DMH checks would stop silently. Re-enabling the workflow
+      # through the API once a week resets that timer without dummy commits.
+      - name: Weekly keep-alive (scheduled runs, Mondays 00:xx UTC)
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H)" = "00" ]; then
+            gh api -X PUT "repos/${REPO}/actions/workflows/deploy.yml/enable" \
+              && echo "Keep-alive: workflow re-enabled." \
+              || echo "::warning title=Keep-alive failed::Could not re-enable the scheduled workflow; it may be disabled after 60 days without commits."
+          fi
+
+  deploy:
+    name: Fetch DMH data and deploy
+    needs: check
+    if: needs.check.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v6
+
+      # Never blocks the deploy: on failure the script keeps the previously
+      # deployed bulletin (ok:false, old checkedAt) and the site shows it as stale.
+      - name: Fetch DMH bulletins
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          PREVIOUS_URL: ${{ steps.pages.outputs.base_url }}/data/dmh.json?run=${{ github.run_id }}
+        run: node scripts/fetch-dmh.mjs --out data/dmh.json --previous "$PREVIOUS_URL"
+
+      - name: Assemble site
+        run: |
+          command -v rsync >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq rsync; }
+          mkdir -p _site
+          rsync -a --delete \
+            --exclude .git --exclude .github --exclude tests --exclude scripts \
+            --exclude node_modules --exclude _site \
+            ./ _site/
+          ls -la _site _site/data || true
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

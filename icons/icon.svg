@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <title>Yangon Storm Watch</title>
+  <rect width="48" height="48" rx="11" fill="#1c5cab"/>
+  <g fill="none" stroke="#fff" stroke-linecap="round" stroke-width="3.2">
+    <circle cx="24" cy="18" r="4.6"/>
+    <path d="M28.6 18C28.6 10.8 23.4 6.9 16.6 7.7M19.4 18C19.4 25.2 24.6 29.1 31.4 28.3"/>
+  </g>
+  <path fill="#fff" fill-rule="evenodd" d="M24 32.2 35.4 41h-3.2v4H15.8v-4h-3.2ZM21.7 45v-4h4.6v4Z"/>
+</svg>
