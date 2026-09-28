@@ -214,8 +214,9 @@ function tidy(s) {
  */
 export function systemName(name, tr = t) {
   const s = String(name ?? '').trim();
-  const m = /^Invest\s+(\w+)$/i.exec(s);
-  const key = m ? 'sys.investName' : /^Invest area$/i.test(s) ? 'sys.investArea' : null;
+  const area = /^Invest area$/i.test(s);
+  const m = area ? null : /^Invest\s+(\w+)$/i.exec(s);
+  const key = area ? 'sys.investArea' : m ? 'sys.investName' : null;
   if (!key) return s;
   const out = tr(key, m ? { designation: m[1] } : undefined);
   // A translator that doesn't know the key (e.g. the map's fallback) returns it as is.

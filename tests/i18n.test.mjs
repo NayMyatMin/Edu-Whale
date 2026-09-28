@@ -360,3 +360,20 @@ test('Burmese reasons render cleanly: no leftover braces, stray gaps or doubled 
   assert.ok(dmh.includes(my['dir.ENE']));
   i18n.setLang('en');
 });
+
+test('storm display names: JTWC invest areas are translated, other names kept', () => {
+  i18n.setLang('en');
+  assert.equal(i18n.systemName('Invest 92W'), 'Invest 92W');
+  assert.equal(i18n.systemName('Surigae'), 'Surigae');
+  i18n.setLang('my');
+  assert.equal(i18n.systemName('Invest 92W'), my['sys.investName'].replace('{designation}', '92W'));
+  assert.equal(i18n.systemName('Invest area'), my['sys.investArea']);
+  assert.equal(i18n.systemName('Surigae'), 'Surigae');
+  // A translator that does not know the key (the map's fallback) keeps the raw name.
+  assert.equal(i18n.systemName('Invest 92W', (k) => k), 'Invest 92W');
+  assert.equal(i18n.listSep(), '၊ ');
+  assert.equal(i18n.localDigits('01-667766'), '၀၁-၆၆၇၇၆၆');
+  i18n.setLang('en');
+  assert.equal(i18n.listSep(), ', ');
+  assert.equal(i18n.localDigits('191'), '191');
+});
