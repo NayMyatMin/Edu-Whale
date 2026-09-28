@@ -1,0 +1,19 @@
+{
+  "name": "Yangon Storm Watch",
+  "short_name": "Storm Watch",
+  "description": "Storm and cyclone guide for Yangon, Myanmar: official DMH bulletins, storms nearby, the local forecast, a preparedness checklist and emergency numbers. English and Burmese.",
+  "lang": "en",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f9f9f7",
+  "theme_color": "#1c5cab",
+  "categories": ["weather", "utilities"],
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
