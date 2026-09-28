@@ -411,9 +411,11 @@ test('pagesToFetch asks for undated listing-only warnings first, then missing la
     'https://www.moezala.gov.mm/en/warning/133839',
   ]);
   const pages = { [first[0]]: fx('warning_133841_en.html') };
-  const second = pagesToFetch({ ...inputs, pages }, { attempted: new Set(first) });
+  const second = pagesToFetch({ ...inputs, pages }, { attempted: new Set(first), now: NOW });
+  // The older News bulletins are replaced by the newer Warning (same system): no need for their text.
   assert.deepEqual(second, ['https://www.moezala.gov.mm/my/warning/133841']);
-  assert.deepEqual(pagesToFetch(ALL()), [], 'nothing to fetch when the RSS has both languages');
+
+  assert.deepEqual(pagesToFetch(ALL(), { now: NOW }), [], 'nothing to fetch when the RSS has both languages');
 });
 
 // ---------------------------------------------------------------------------
@@ -485,4 +487,204 @@ test('fetch-dmh exits 0 and keeps previous data when DMH is unreachable', () => 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: concurrent series, nil notices, unread / mistyped dates,
+// DMH's 2023 bulletin format, scoped stages, final bulletins, title variants
+// ---------------------------------------------------------------------------
+
+const { evaluateDmh } = await import('../js/dmh.js');
+const { assessRisk } = await import('../js/risk.js');
+const { HOME: HOME_PT } = await import('../js/config.js');
+const PAGES = join(FIX, 'pages');
+const pageFx = (name) => readFileSync(join(PAGES, name), 'utf8');
+const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/** One DMH RSS <item> in the site's real markup. */
+function rssItem({ id, kind = 'news', title, post, created = post, body }) {
+  const html =
+    `<span class="field field-name-title field-formatter-string">${title}</span>` +
+    `<span class="field field-name-created"><time datetime="${created}" class="datetime">x</time></span>` +
+    `<div class="field field-name-field-${kind}-post-date"><div class="field__item"><time datetime="${post}" class="datetime">x</time></div></div>` +
+    `<div class="clearfix text-formatted field field-name-body"><div class="field__item">${body.split('\n').map((p) => `<p>${p}</p>`).join('')}</div></div>`;
+  return `<item><title>${esc(title)}</title><link>https://www.moezala.gov.mm/en/${kind}/${id}</link><description>${esc(html)}</description><pubDate>Mon, 28 Sep 2026 20:00:00 +0630</pubDate></item>`;
+}
+const withItems = (xml, ...items) => xml.replace('</channel>', `${items.join('\n')}</channel>`);
+const riskOf = (json, now = NOW) => assessRisk({ systems: [], dmh: evaluateDmh(JSON.parse(JSON.stringify(json)), HOME_PT, now), weather: { derived: { next72h: {} } }, now });
+
+const ARABIAN_LOW = rssItem({
+  id: 133850,
+  title: 'Low Pressure Area Condition',
+  post: '2026-09-28T13:30:00Z',
+  body: 'Low Pressure Area Condition\nIssued at 20:00 hours M.S.T on 28-9-2026\nAccording to the observations at 18:30 hrs MST today, the low pressure area over the Southeast Arabian Sea still persists. It is likely to move West-Northwestwards.',
+});
+
+test('concurrent DMH series: a later News about another system never hides the Brown Warning near Yangon', () => {
+  const now = new Date('2026-09-28T14:00:00Z');
+  const json = buildDmhJson({ ...ALL(), rssEn: withItems(fx('rss_en.xml'), ARABIAN_LOW), now });
+  assert.equal(json.cyclone.id, '133841', 'the Warning leads, not the newer unrelated News');
+  assert.equal(json.cyclone.stage, 'brown');
+  assert.ok(json.cyclone.summary.en.length > 50, 'with its text');
+  assert.ok(json.recentCyclone.some((b) => b.id === '133850'), 'the News is kept too');
+  const status = evaluateDmh(JSON.parse(JSON.stringify(json)), HOME_PT, now);
+  assert.deepEqual(status.inForce.map((b) => b.id), ['133841', '133850'], 'both series in force, the Warning first');
+  const r = riskOf(json, now);
+  assert.equal(r.level, 3);
+  assert.equal(r.reasons[0].code, 'dmh.stage');
+  assert.ok(r.reasons.some((x) => x.code === 'dmh.news'));
+
+  // Even when an old data/dmh.json put the News first, the client still counts the Warning in `recent`.
+  const old = JSON.parse(JSON.stringify(json));
+  old.cyclone = { ...old.recentCyclone.find((b) => b.id === '133850'), summary: { en: '', my: '' } };
+  assert.equal(riskOf(old, now).level, 3);
+  // A distant News posted after it, with a position (Sri Lanka), counts separately as well.
+  const far = rssItem({ id: 133851, title: 'Deep Depression News, No.3, 2026', post: '2026-09-28T13:45:00Z', body: 'Deep Depression News, No.3, 2026\nThe Deep Depression is centred at about Latitude 6.7 degree North and Longitude 82.1 degree East. The present stage is coded yellow stage.' });
+  const j2 = buildDmhJson({ ...ALL(), rssEn: withItems(fx('rss_en.xml'), far), now });
+  assert.equal(j2.cyclone.id, '133841');
+  assert.equal(riskOf(j2, now).level, 3);
+});
+
+test('concurrent DMH series: a newer bulletin about the same system still replaces the Warning', () => {
+  const now = new Date('2026-09-28T17:00:00Z');
+  const green = rssItem({
+    id: 133860,
+    kind: 'warning',
+    title: 'Deep Depression Warning, No.4, 2026',
+    post: '2026-09-28T16:30:00Z',
+    body: 'Deep Depression Warning, No.4, 2026\nIssued at 23:00 hours M.S.T on 28-9-2026\nThe Deep Depression has weakened into a low pressure area centred at about Latitude 17.9 degree North and Longitude 96.5 degree East, over Bago Region. The present stage is coded green stage.',
+  });
+  const json = buildDmhJson({ ...ALL(), rssEn: withItems(fx('rss_en.xml'), green), now });
+  assert.equal(json.cyclone.id, '133860');
+  const status = evaluateDmh(JSON.parse(JSON.stringify(json)), HOME_PT, now);
+  assert.deepEqual(status.inForce.map((b) => b.id), ['133860'], 'No.4 continues the series and replaces No.3');
+  assert.equal(riskOf(json, now).level, 1, 'Green stage near Yangon: Monitor');
+});
+
+test('DMH "Nothing Special" notices and "Condition" posts under /warning/ are not warnings in force', () => {
+  const nilPages = {
+    'https://www.moezala.gov.mm/en/warning/133288': pageFx('warning_133288_en.html'),
+    'https://www.moezala.gov.mm/my/warning/133288': pageFx('warning_133288_my.html'),
+  };
+  const home = fx('home_en.html').replace(/warning\/13384[01]/g, 'warning/133288').replace(/warning\/133839/g, 'warning/133288');
+  const now = new Date('2026-09-26T03:00:00Z');
+  const json = buildDmhJson({ homeEn: home, pages: nilPages, now });
+  assert.ok(!json.recentCyclone.some((b) => b.id === '133288'));
+  assert.notEqual(json.cyclone?.id, '133288');
+  assert.equal(systemFromTitle('Cyclone Warning'), null, 'the generic title names no system');
+  const lpa = extractBulletinPage(pageFx('warning_132365_en.html'));
+  const b = parseCycloneBulletin({ titleEn: lpa.title, bodyEn: lpa.bodyText, url: 'https://www.moezala.gov.mm/en/warning/132365', postIso: lpa.postIso });
+  assert.equal(b.kind, 'news', 'a Condition post is News even under /warning/');
+  assert.equal(b.system, 'low');
+  const nilNews = extractBulletinPage(pageFx('news_129949_en.html'));
+  assert.equal(nilNews.bodyText, 'Nothing Special');
+});
+
+test('undated Warnings seen on a listing are reported (partial), never dropped silently', () => {
+  // RSS down, warning pages unreachable: only the home pages and the cyclone-news listing.
+  const now = new Date('2026-09-28T14:00:00Z');
+  const json = buildDmhJson({ homeEn: fx('home_en.html'), homeMy: fx('home_my.html'), cycloneNewsEn: fx('cyclone-news_en.html'), now });
+  assert.equal(json.partial, true);
+  assert.deepEqual(json.undatedCyclone.map((u) => [u.id, u.kind]), [['133841', 'warning'], ['133840', 'warning'], ['133839', 'warning']]);
+  const status = evaluateDmh(JSON.parse(JSON.stringify(json)), HOME_PT, now);
+  assert.equal(status.partial, true);
+  const r = assessRisk({ systems: [], dmh: status, weather: null, now });
+  assert.equal(r.level, null, 'Unknown — check DMH, never Calm or Monitor');
+  assert.ok(r.gaps.includes('dmh'));
+  // RSS with its upload time but no post date: the upload time stands in.
+  const rss = fx('rss_en.xml').replace(/field-name-field-warning-post-date/g, 'field-name-field-other');
+  const j2 = buildDmhJson({ rssEn: rss, now: new Date('2026-09-28T15:00:00Z') });
+  assert.equal(j2.cyclone.id, '133841');
+  assert.equal(j2.cyclone.issuedAtEstimated, true);
+  assert.equal(j2.partial, false);
+});
+
+test('a mistyped DMH post date does not expire (or pin) a Warning', () => {
+  const typo = (xml) => xml.replace(/2026-09-28T12:30:00Z/g, '2026-09-29T12:30:00Z');
+  const at = new Date('2026-09-28T15:00:00Z');
+  const json = buildDmhJson({ ...ALL(), rssEn: typo(fx('rss_en.xml')), rssMy: typo(fx('rss_my.xml')), now: at });
+  assert.equal(json.cyclone.id, '133841');
+  assert.equal(json.cyclone.issuedAtEstimated, true);
+  assert.ok(Date.parse(json.cyclone.issuedAt) <= +at, `issued ${json.cyclone.issuedAt} (upload time)`);
+  assert.equal(riskOf(json, at).level, 3);
+  // A correct No.4 later wins, and the typo does not stay "newest" via --previous.
+  const no4 = rssItem({ id: 133845, kind: 'warning', title: 'Deep Depression Warning, No.4, 2026', post: '2026-09-28T15:30:00Z', body: 'Deep Depression Warning, No.4, 2026\nThe Deep Depression is centred at about Latitude 17.6 degree North and Longitude 96.8 degree East. The present stage is coded brown stage.' });
+  const later = new Date('2026-09-28T16:30:00Z');
+  const j2 = buildDmhJson({ ...ALL(), rssEn: withItems(fx('rss_en.xml'), no4), now: later, previous: json });
+  assert.equal(j2.cyclone.id, '133845');
+  // A 2027 typo from an old file is carried as "last seen", so it expires normally.
+  const pinned = { ...json, cyclone: { ...json.cyclone, issuedAt: '2027-09-28T12:30:00Z', issuedAtEstimated: false } };
+  const j3 = buildDmhJson({ ...ALL(), now: new Date('2026-10-05T00:00:00Z'), previous: pinned });
+  assert.ok(!j3.recentCyclone.some((b) => Date.parse(b.issuedAt) > Date.parse('2026-10-05T06:00:00Z')));
+});
+
+test("DMH's 2023 format: bracketed numbers, lettered Burmese headings, the rain list is not a track", () => {
+  const en = extractBulletinPage(pageFx('warning_90424_en.html'));
+  const my = extractBulletinPage(pageFx('warning_90424_my.html'));
+  const b = parseCycloneBulletin({ titleEn: en.title, bodyEn: en.bodyText, titleMy: my.title, bodyMy: my.bodyText, url: 'https://www.moezala.gov.mm/en/warning/90424', postIso: en.postIso });
+  assert.equal(b.stage, 'brown');
+  assert.equal(b.system, 'escs');
+  assert.deepEqual([b.lat, b.lon, b.pressureHpa], [20, 92.3, 944]);
+  assert.deepEqual([b.windMph.min, b.windMph.max], [120, 130]);
+  assert.equal(b.mentionsYangon, false, 'Yangon only in the caution rain list');
+  assert.ok(splitSections(en.bodyText).forecast.length > 0, '"During next (32) hours forecast" is a heading');
+  const mySec = splitSections(my.bodyText);
+  assert.ok(mySec.caution.length > 0, '(ဃ) caution heading recognised');
+  assert.ok(!mySec.forecast.some((p) => /ရန်ကုန်/.test(p)), 'the rain list is not in the forecast');
+  // (ခ) forecast / (ဂ) caution after landfall
+  const m33 = extractBulletinPage(pageFx('warning_90465_my.html'));
+  const sec33 = splitSections(m33.bodyText);
+  assert.ok(sec33.caution.length > 0 && !sec33.forecast.some((p) => /ရန်ကုန်/.test(p)));
+  // Burmese stage word broken by a line-wrap space ("အညို ရောင်")
+  const w27 = extractBulletinPage(pageFx('warning_90418_my.html'));
+  assert.equal(parseCycloneBulletin({ titleMy: w27.title, bodyMy: w27.bodyText, url: 'https://www.moezala.gov.mm/my/warning/90418' }).stage, 'brown');
+});
+
+test('region-scoped stages: a stage for other regions does not apply to Yangon; one for Yangon wins', () => {
+  const en = extractBulletinPage(pageFx('warning_90465_en.html'));
+  const my = extractBulletinPage(pageFx('warning_90465_my.html'));
+  const b = parseCycloneBulletin({ titleEn: en.title, bodyEn: en.bodyText, titleMy: my.title, bodyMy: my.bodyText, url: 'https://www.moezala.gov.mm/en/warning/90465', postIso: en.postIso });
+  assert.equal(b.stage, 'brown');
+  assert.equal(b.stageScope, 'other-regions');
+  assert.equal(b.mentionsYangon, false);
+  const json = { schema: 1, checkedAt: '2023-05-15T08:00:00Z', ok: true, cyclone: { ...b, summary: { en: '', my: '' } }, recentCyclone: [] };
+  assert.equal(riskOf(json, new Date('2023-05-15T09:00:00Z')).level, 1, 'Monitor, not Prepare/Danger');
+  const reverse = 'the present stage for Rakhine and Chin States is coded green stage. It is moving towards the south. The present stage for Bago, Yangon Regions is coded red stage.';
+  const r = parseCycloneBulletin({ titleEn: 'Cyclonic Storm Warning, No.9, 2026', bodyEn: reverse, url: 'https://www.moezala.gov.mm/en/warning/1' });
+  assert.equal(r.stage, 'red');
+  assert.equal(r.stageScope, undefined);
+  const both = parseCycloneBulletin({ titleEn: 'Cyclonic Storm Warning, No.9, 2026', bodyEn: 'The storm is coded green stage. Later the storm is coded red stage.', url: 'https://www.moezala.gov.mm/en/warning/1' });
+  assert.equal(both.stage, 'red', 'several unscoped stages: the most severe');
+});
+
+test('"This is the last news": final and weakening, and informational only', () => {
+  for (const name of ['news_133700_en.html', 'news_123077_en.html']) {
+    const p = extractBulletinPage(pageFx(name));
+    const b = parseCycloneBulletin({ titleEn: p.title, bodyEn: p.bodyText, url: 'https://www.moezala.gov.mm/en/news/1', postIso: p.postIso });
+    assert.equal(b.final, true, name);
+    assert.equal(b.weakening, true, name);
+    const json = { schema: 1, checkedAt: p.postIso, ok: true, cyclone: { ...b, summary: { en: '', my: '' } }, recentCyclone: [] };
+    const r = riskOf(json, new Date(Date.parse(p.postIso) + 3600e3));
+    assert.equal(r.level, 0, name);
+    assert.ok(r.reasons.some((x) => x.code === 'dmh.newsFinal'));
+  }
+});
+
+test('title variants: run-together words and western Pacific names', () => {
+  const p = extractBulletinPage(pageFx('news_127313_en.html'));
+  assert.equal(isCycloneTitle(p.title), true, 'WellMarkedLowPressureAreaCondition');
+  assert.equal(systemFromTitle(p.title), 'well-marked-low');
+  assert.equal(systemFromTitle('Typhoon “KALMAEGI” News, No.2, 2025'), 'vscs');
+  assert.equal(systemFromTitle('Tropical Storm “FENGSHEN” News'), 'cs');
+  assert.equal(systemFromTitle('Severe Tropical Storm “FENGSHEN” News'), 'scs');
+  assert.equal(isCycloneTitle('Thunderstorm Warning'), false);
+});
+
+test('site chrome on every DMH page does not make a broken listing look healthy', () => {
+  // Bulletin URLs no longer parse (e.g. new aliases); only the sidebar article link /my/news/129907 remains.
+  const broken = (html) => html.replace(/\/(en|my)\/(warning|news|top-announcement|bulletin)\/(?!129907)(\d+)/g, '/$1/node/$3');
+  const previous = buildDmhJson({ ...ALL(), now: NOW });
+  const json = buildDmhJson({ homeEn: broken(fx('home_en.html')), homeMy: broken(fx('home_my.html')), cycloneNewsEn: broken(fx('cyclone-news_en.html')), now: new Date('2026-09-28T16:00:00Z'), previous });
+  assert.equal(json.ok, false);
+  assert.equal(json.checkedAt, previous.checkedAt, 'old check time kept, so the page shows DMH as stale');
 });

@@ -2,7 +2,7 @@
 // Every threshold used by the attention-level logic lives here so the
 // "How this works" section can render the exact same numbers it applies.
 
-export const APP_VERSION = '1.0.0';
+export const APP_VERSION = '1.1.0';
 
 export const HOME = Object.freeze({
   id: 'yangon',
@@ -50,11 +50,11 @@ export const URLS = Object.freeze({
 });
 
 // Satellite loop: GIBS frames are every 10 min but are only reliably served
-// ~40 min after their nominal time.
+// ~50 min after their nominal time (newer ones still 404 at random).
 export const SATELLITE = Object.freeze({
   frameStepMin: 30,
   frames: 12,
-  safetyLagMin: 45,
+  safetyLagMin: 55,
   opacity: 0.6,
   maxNativeZoom: 6,
 });
@@ -123,7 +123,8 @@ export const THRESHOLDS = Object.freeze({
       trackHoursTS: 48, // ...within this many hours
       trackKmHU: 300, // HU (>= 64 kt) forecast within this distance...
       trackHoursHU: 48,
-      insideSwathKmh: 90, // Yangon inside a forecast >= 90 km/h wind area
+      insideSwathKmh: 90, // Yangon inside a forecast >= 90 km/h wind area...
+      insideSwathHours: 48, // ...valid within this many hours
     },
     prepare: {
       trackKmAny: 300, // any warned system (TD+) forecast within this distance...
@@ -132,7 +133,9 @@ export const THRESHOLDS = Object.freeze({
       trackKmHU: 600, // a HU forecast within this distance within 72 h
       trackHoursHU: 72,
       insideSwathKmh: 60, // Yangon inside the >= 60 km/h wind area or the uncertainty cone
+      insideSwathHours: 72, // (wind areas valid within this many hours; later ones: monitor)
       tcfaKm: 300, // a JTWC formation alert centred this close
+      tcfaNoCorridorKm: 600, // an alert whose area could not be read, centred this close
     },
     monitor: {
       nearbyKm: 1000, // any active system within this distance...
@@ -140,6 +143,12 @@ export const THRESHOLDS = Object.freeze({
       trackKm: 600, // or any forecast point within this distance
       investKm: 600, // an invest area (any potential) this close
     },
+    // A position fix older than this no longer counts as "where the storm is now".
+    maxFixAgeHours: 24,
+    // A JTWC final warning counts at most as Monitor this long after it was issued.
+    finalMaxAgeHours: 12,
+    // A formation alert this long past its "valid until" time counts as an invest.
+    tcfaLapseHours: 6,
   },
   // Open-Meteo local forecast for Yangon, next 72 hours.
   weather: {
@@ -150,18 +159,22 @@ export const THRESHOLDS = Object.freeze({
     pressureFallHpa3h: 3, // shown as a note, never raises the level on its own
   },
   // DMH official bulletins (data/dmh.json). A bulletin counts as current if
-  // issued within `currentHours`. `nearKm` decides whether an official stage
-  // applies to Yangon itself (DMH stages are national).
+  // issued within `currentHours`. The distance of DMH's position from Yangon
+  // decides how much an official stage applies to Yangon itself (DMH stages
+  // are national): within `dangerKm` (`dangerKmWeak` for lows and
+  // depressions) or naming Yangon, within `nearKm`, or further away.
   dmh: {
     currentHours: 24,
+    dangerKm: 300,
+    dangerKmWeak: 200,
     nearKm: 500,
-    // stage -> [level if near Yangon or bulletin names Yangon, level otherwise]
+    // stage -> [level within dangerKm or naming Yangon, level within nearKm, level further away]
     stageFloor: {
-      brown: [3, 2],
-      red: [3, 2],
-      orange: [2, 1],
-      yellow: [1, 1],
-      green: [1, 0],
+      brown: [3, 2, 2],
+      red: [3, 2, 2],
+      orange: [2, 2, 1],
+      yellow: [1, 1, 1],
+      green: [1, 1, 0],
     },
     newsFloor: 1, // a DMH "News" bulletin (system not heading for Myanmar)
     otherWarningFloor: 1, // flood / heavy rain / strong wind warning naming Yangon

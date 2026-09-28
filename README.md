@@ -50,23 +50,27 @@ The site therefore takes the **highest** level from all sources, and treats miss
 Every threshold lives in [`js/config.js`](js/config.js) (`THRESHOLDS`), and the "How this works" section on
 the page is generated from it. The final level is the highest of these four:
 
-1. **DMH:** a current bulletin's stage, which applies fully when the storm is within 500 km of Yangon or the
-   bulletin names Yangon.
+1. **DMH:** every current bulletin still in force (DMH can run series for two systems at once). A Red or Brown
+   stage means *Danger* when the storm is within 300 km of Yangon (200 km for a low or depression) or the
+   bulletin names Yangon, and *Prepare* further away.
 2. **Storms:** how close each system's current position or forecast track comes to Yangon, how strong it is,
    and when. This includes whether Yangon lies inside a forecast wind area or cone.
 3. **Local forecast (next 72 h):** gusts, steady wind, and rain over 1, 24, 48 and 72 hours.
 4. **Manual override:** optional, see below.
 
-If both storm feeds fail and DMH can't be checked, the level is *Unknown*. It is never *Calm*.
+If DMH can't be checked (or the last check is over 3 hours old, or incomplete), the level is *Unknown* unless
+another source already says *Prepare* or *Danger*. It is never *Calm*.
 
 ## Setup (repository owner)
 
-1. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
-   - The `Deploy site` workflow ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) then publishes
-     the site on every push to `main` and every 30 minutes, with fresh DMH data.
-   - The custom domain (`eduwhale.info`) stays set in Pages settings.
-   - Until you switch the source, the workflow skips itself with a notice (no failure emails). The site still
-     works from the branch, but shows "automatic DMH check not set up".
+1. **Required: Settings → Pages → Build and deployment → Source: GitHub Actions.**
+   - The `Deploy site` workflow ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) then runs the
+     tests and publishes the site on every push to `main` and every 30 minutes, with fresh DMH data.
+   - Until you switch the source, the workflow skips itself with a notice (no failure emails). Deployed from the
+     branch the site has no DMH data at all, so it can only ever say *Unknown — check DMH* (or Prepare/Danger).
+   - **Custom domain:** `eduwhale.info` must be registered and point at GitHub Pages (and be verified in your
+     account's Pages settings), or be removed under Settings → Pages. A custom domain that does not resolve
+     makes the whole site unreachable (the github.io address redirects to it).
 2. The schedule keeps itself alive: it re-enables itself weekly, because GitHub pauses scheduled workflows after
    60 days without activity. If DMH checks ever stop, open **Actions → Deploy site → Enable workflow**.
 3. **Manual override (optional):** edit [`data/override.json`](data/override.json) on GitHub.

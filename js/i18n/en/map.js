@@ -32,7 +32,7 @@ export default {
   'map.sat.pause': 'Pause',
   'map.sat.pauseLabel': 'Pause the satellite loop',
   'map.sat.step': 'Next image',
-  'map.sat.stepLabel': 'Show the next satellite image',
+  'map.sat.stepLabel': 'Next image — show the next satellite image',
   'map.sat.loading': 'Loading satellite images…',
   'map.sat.slider': 'Time of the satellite image',
   'map.sat.time': 'Satellite {when}',
@@ -50,7 +50,7 @@ export default {
 
   // Hints
   'map.hint.mouse': 'Click the map to zoom with the mouse wheel.',
-  'map.hint.touch': 'Tap the map once, then drag to move it. Pinch to zoom.',
+  'map.hint.touch': 'Tap an empty part of the map, then drag to move it. Pinch to zoom. After a few seconds, swiping scrolls the page again.',
 
   // Legend
   'map.legend.title': 'Map key',
@@ -89,7 +89,9 @@ export default {
   'map.popup.closest': 'Closest forecast approach: {dist} around {when}',
   'map.popup.potential': 'Chance of becoming a cyclone: {chance}',
   'map.popup.validUntil': 'Alert valid until {when}',
+  'map.popup.validLapsed': 'JTWC was due to renew or cancel this alert at {when}; its update has not reached this page yet.',
   'map.popup.sources': 'Source: {list}',
+  'map.popup.listSep': ', ',
   'map.dmh.wind': 'Wind (as DMH states it): {wind}',
   'map.kind.warning': 'Tropical cyclone',
   'map.popup.forecast': 'Forecast',

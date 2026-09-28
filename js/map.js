@@ -23,7 +23,8 @@ import {
 } from './config.js';
 import { bearingDeg, circlePolygon, compass16, destinationPoint, haversineKm, wrapLonDelta } from './geo.js';
 import { fetchJson, fetchText } from './net.js';
-import { imdClassKey } from './systems.js';
+import { currentWindAreas, imdClassKey } from './systems.js';
+import { systemName } from './i18n.js';
 import enMap from './i18n/en/map.js';
 
 const MIN_MS = 60e3;
@@ -45,11 +46,14 @@ const RADAR_REFRESH_MS = 10 * MIN_MS;
 const RADAR_OPACITY = 0.7;
 const RADAR_MAX_NATIVE_ZOOM = 7;
 
-// Same rule as systems.js `insideWindKmh`, so the map shows exactly the wind
-// areas the status reasons talk about.
-const WIND_AREA_MAX_AGE_MS = 3 * HOUR_MS;
 const WIND_STRENGTHS = [60, 90, 120];
-const WIND_FILL_OPACITY = { 60: 0.1, 90: 0.14, 120: 0.18 };
+// Filled without outlines (each forecast time's circle would otherwise read as another range ring).
+const WIND_FILL_OPACITY = { 60: 0.16, 90: 0.22, 120: 0.28 };
+// A satellite frame that fails is replaced by an older listed one, at most this many times / this far back.
+const SAT_FALLBACK_STEPS = 3;
+const SAT_FALLBACK_MAX_MS = 90 * MIN_MS;
+// On touch screens, one-finger dragging moves the map only for a while after a tap on it.
+const TOUCH_ENGAGE_IDLE_MS = 8000;
 const CONE_FILL_OPACITY = 0.12;
 const INVEST_RADIUS_KM = 150;
 // A focused system brings Yangon into view only when it is reasonably close.
@@ -59,6 +63,11 @@ const FOCUS_WITH_HOME_KM = 1500;
 const FIT_NEAR_KM = 2500;
 // Ring labels closer than this to Yangon on screen are hidden (zoomed out).
 const RING_LABEL_MIN_PX = 40;
+// Where a ring label may sit (bearing from Yangon, first free one wins): over
+// the Gulf of Mottama first, where storm names and place names are rarest.
+const RING_LABEL_BEARINGS = [180, 200, 160, 225, 135, 250, 110, 270, 90];
+// Storm label sides, in order of preference.
+const LABEL_SIDES = ['right', 'left', 'above', 'below'];
 
 const FIT_MAX_ZOOM = 7;
 // Left: clear the zoom and fit buttons (about 56 px) plus half a centred label
@@ -81,6 +90,8 @@ const PANES = Object.freeze({
   tracks: ['ymap-tracks', 420],
   markers: ['ymap-markers', 610],
   home: ['ymap-home', 630],
+  // Popups after the markers in the page, so Tab reaches them in reading order.
+  popup: ['ymap-popup', 700],
 });
 const PANE = Object.fromEntries(Object.entries(PANES).map(([k, [name]]) => [k, name]));
 
@@ -149,9 +160,11 @@ export function parseGibsDomains(xml) {
 
 /**
  * Choose the loop frames: drop times newer than now − safetyLag (GIBS lists
- * frames before every server can deliver them), then walk back from the
- * newest kept time in `stepMin` buckets taking the latest available time in
- * each bucket. Returns chronological Dates (newest last), or [].
+ * frames before every server can deliver them); the newest kept time is the
+ * last frame, and the older ones sit on fixed clock buckets (the latest
+ * available time at or before each :00 / :30), so a refresh ten minutes later
+ * shares all but the newest frame and reuses their loaded images. Returns
+ * chronological Dates (newest last), or [].
  */
 export function pickSatelliteFrames(times, now = new Date(), opts = {}) {
   const frames = opts.frames ?? SATELLITE.frames;
@@ -164,16 +177,25 @@ export function pickSatelliteFrames(times, now = new Date(), opts = {}) {
   if (!avail.length || !(frames > 0) || !(stepMs > 0)) return [];
   const newest = avail[avail.length - 1];
   const out = [newest];
+  const anchor = Math.floor(newest / stepMs) * stepMs;
   let idx = avail.length - 1;
-  for (let k = 1; out.length < frames; k++) {
-    const target = newest - k * stepMs;
-    if (target < avail[0] - stepMs) break;
-    while (idx >= 0 && avail[idx] > target) idx--;
+  for (let k = 0; out.length < frames; k++) {
+    const hi = anchor - k * stepMs; // bucket (hi − step, hi]
+    if (hi < avail[0]) break;
+    while (idx >= 0 && avail[idx] > hi) idx--;
     if (idx < 0) break;
     // Only accept a time inside this bucket, so spacing stays regular across gaps.
-    if (avail[idx] > target - stepMs && avail[idx] < out[out.length - 1]) out.push(avail[idx]);
+    if (avail[idx] > hi - stepMs && avail[idx] < out[out.length - 1]) out.push(avail[idx]);
   }
   return out.reverse().map((t) => new Date(t));
+}
+
+/** Listed time just before `t` (a failed frame's stand-in), skipping Himawari's daily gaps, or null. */
+export function olderSatelliteTime(times, t, { notBefore = -Infinity } = {}) {
+  const tt = timeMs(t);
+  const list = (times ?? []).map(timeMs).filter((x) => x !== null && x < tt && x >= notBefore).sort((a, b) => b - a);
+  const hit = list.find((x) => !HIMAWARI_DAILY_GAPS.has(new Date(x).toISOString().slice(11, 16)));
+  return hit === undefined ? null : new Date(hit);
 }
 
 /** When the time list cannot be fetched: now − 60 min, floored to 10 min, skipping Himawari's daily gaps. */
@@ -263,15 +285,14 @@ export function unionRings(geometries, ref = HOME.lon) {
   return rings;
 }
 
-/** GDACS wind areas valid now or later (time ≥ now − 3 h), grouped by strength. */
-export function activeWindAreas(windAreas, now = new Date(), maxAgeMs = WIND_AREA_MAX_AGE_MS) {
+/**
+ * GDACS wind areas describing the storm now or later, grouped by strength:
+ * the same selection as systems.js `currentWindAreas` (which the status
+ * reasons use), so the map shows exactly the areas they talk about.
+ */
+export function activeWindAreas(windAreas, now = new Date()) {
   const out = { 60: [], 90: [], 120: [] };
-  for (const a of Array.isArray(windAreas) ? windAreas : []) {
-    if (!a || !Object.hasOwn(out, a.kmh) || !a.feature?.geometry) continue;
-    const t = timeMs(a.time);
-    if (t === null || t < +now - maxAgeMs) continue;
-    out[a.kmh].push(a);
-  }
+  for (const a of currentWindAreas(windAreas, now)) if (Object.hasOwn(out, a.kmh)) out[a.kmh].push(a);
   return out;
 }
 
@@ -665,9 +686,9 @@ export function createMap(el, options = {}) {
     const Fit = L.Control.extend({
       onAdd() {
         const wrap = L.DomUtil.create('div', 'leaflet-bar ymap-fit');
-        const btn = L.DomUtil.create('a', '', wrap);
-        btn.href = '#';
-        btn.setAttribute('role', 'button');
+        // A real button: Space and Enter both press it, and Space never scrolls the page.
+        const btn = L.DomUtil.create('button', 'ymap-fit-btn', wrap);
+        btn.type = 'button';
         btn.title = t('map.fit');
         btn.setAttribute('aria-label', t('map.fit'));
         btn.innerHTML = ICONS.fit;
@@ -831,6 +852,7 @@ export function createMap(el, options = {}) {
     ui.mapOnly.hidden = !isMap;
     if (isMap) {
       map.invalidateSize();
+      if (sat.stale && layerState.satellite) satRefresh();
     } else {
       satPause();
       mountWindy(windyFrameWrap, home, { title: t('map.windy.title') });
@@ -858,18 +880,47 @@ export function createMap(el, options = {}) {
   }
 
   // --- satellite (GIBS Himawari IR) ---------------------------------------------------
-  const sat = { frames: [], layers: [], ready: [], index: -1, playing: false, loading: false, timer: 0, steppedBack: false, fetchedAt: 0, refreshing: false, source: 'none' };
+  // Only the frame on screen keeps a tile layer (and its images) when the loop
+  // is not playing: hidden frames would otherwise reload on every zoom or pan.
+  const sat = {
+    frames: [],
+    layers: [],
+    ready: [],
+    tiles: [],
+    index: -1,
+    playing: false,
+    loading: false,
+    timer: 0,
+    fetchedAt: 0,
+    refreshing: false,
+    source: 'none',
+    avail: [],
+    failed: false,
+    fallbacks: 0,
+    stale: false,
+  };
+
+  /** The map is on screen (tab, page and scroll position): only then are satellite frames worth loading. */
+  let mapInView = true;
+  const mapVisible = () => activeTab === 'map' && !globalThis.document?.hidden && mapInView;
 
   async function satRefresh() {
     if (sat.refreshing || sat.playing || destroyed) return;
+    if (!mapVisible()) {
+      sat.stale = true;
+      return;
+    }
+    sat.stale = false;
     sat.refreshing = true;
     satUpdateUi();
     const now = nowFn();
     let frames = [];
+    let avail = [];
     let source = 'domains';
     try {
       const xml = await fetchText(gibsDomainsUrl(now), { timeoutMs: NETWORK_TIMEOUT_MS });
-      frames = pickSatelliteFrames(parseGibsDomains(xml), now);
+      avail = parseGibsDomains(xml);
+      frames = pickSatelliteFrames(avail, now);
     } catch {
       frames = [];
     }
@@ -880,25 +931,48 @@ export function createMap(el, options = {}) {
     sat.refreshing = false;
     if (destroyed || sat.playing) return;
     sat.fetchedAt = Date.now();
+    sat.avail = avail.filter((d) => +d <= +now - SATELLITE.safetyLagMin * MIN_MS);
     const unchanged = frames.length === sat.frames.length && frames.every((f, i) => +f === +sat.frames[i]);
     if (!unchanged) satSetFrames(frames, source);
     else satUpdateUi();
   }
 
-  function satClearLayers() {
-    for (const layer of sat.layers) if (layer) groups.satellite.removeLayer(layer);
-    sat.layers = [];
-    sat.ready = [];
+  function satRemoveLayer(i) {
+    const layer = sat.layers[i];
+    if (layer) groups.satellite.removeLayer(layer);
+    sat.layers[i] = null;
+    sat.ready[i] = false;
+    sat.tiles[i] = null;
   }
 
+  /** New frame list: layers for frames that stay are kept (their images are loaded), the rest dropped. */
   function satSetFrames(frames, source) {
-    satClearLayers();
+    const byTime = new Map(sat.frames.map((f, i) => [+f, i]));
+    const shown = sat.index >= 0 ? +sat.frames[sat.index] : null;
+    const layers = frames.map(() => null);
+    const ready = frames.map(() => false);
+    const tiles = frames.map(() => null);
+    const kept = new Set();
+    frames.forEach((f, i) => {
+      const j = byTime.get(+f);
+      if (j !== undefined && sat.layers[j]) {
+        layers[i] = sat.layers[j];
+        ready[i] = sat.ready[j];
+        tiles[i] = sat.tiles[j];
+        kept.add(j);
+      }
+    });
+    sat.layers.forEach((layer, j) => {
+      if (layer && !kept.has(j)) groups.satellite.removeLayer(layer);
+    });
     sat.frames = frames;
-    sat.layers = frames.map(() => null);
-    sat.ready = frames.map(() => false);
-    sat.steppedBack = false;
+    sat.layers = layers;
+    sat.ready = ready;
+    sat.tiles = tiles;
     sat.source = source;
-    sat.index = -1;
+    sat.failed = false;
+    sat.fallbacks = 0;
+    sat.index = shown !== null ? frames.findIndex((f) => +f === shown) : -1;
     satShow(frames.length - 1);
   }
 
@@ -913,42 +987,65 @@ export function createMap(el, options = {}) {
       crossOrigin: 'anonymous',
       className: 'ymap-sat-frame',
     });
+    const counts = { ok: 0, bad: 0 };
     layer.on('loading', () => {
       const k = sat.layers.indexOf(layer);
+      counts.ok = 0;
+      counts.bad = 0;
       if (k >= 0) sat.ready[k] = false;
     });
+    layer.on('tileload', () => counts.ok++);
+    // Leaflet fires "load" even when every tile failed: only count frames with images.
     layer.on('load', () => {
       const k = sat.layers.indexOf(layer);
-      if (k >= 0) sat.ready[k] = true;
+      if (k < 0) return;
+      sat.ready[k] = true;
+      sat.tiles[k] = { ...counts };
+      if (counts.ok === 0 && counts.bad > 0) satFrameFailed(k);
+      else satUpdateUi();
     });
-    // GIBS lists frames before every one of its servers can deliver them, so
-    // the newest frame can come back with holes (some tiles 404 at random for
-    // a while). Any failed tile in the newest frame: fall back 10 min, once.
+    // GIBS lists frames before every one of its servers can deliver them, so a
+    // frame can come back with holes: the newest one falls back to an older
+    // listed time (never a guessed one, which may be a Himawari gap).
     layer.on('tileerror', () => {
+      counts.bad++;
       const k = sat.layers.indexOf(layer);
-      if (sat.steppedBack || k !== sat.frames.length - 1) return;
-      sat.steppedBack = true;
-      const wasCurrent = sat.index === k;
-      groups.satellite.removeLayer(layer);
-      const older = new Date(+sat.frames[k] - 10 * MIN_MS);
-      if (k > 0 && +sat.frames[k - 1] >= +older) {
-        sat.frames.splice(k, 1);
-        sat.layers.splice(k, 1);
-        sat.ready.splice(k, 1);
-      } else {
-        sat.frames[k] = older;
-        sat.layers[k] = null;
-        sat.ready[k] = false;
-      }
-      if (wasCurrent) {
-        sat.index = -1;
-        satShow(sat.frames.length - 1);
-      } else satUpdateUi();
+      if (k === sat.frames.length - 1 && counts.bad === 1) satFrameFailed(k);
     });
     sat.layers[i] = layer;
     sat.ready[i] = false;
+    sat.tiles[i] = null;
     groups.satellite.addLayer(layer);
     return layer;
+  }
+
+  /** Frame k has failed tiles: the newest frame steps back through older listed times; others are dropped. */
+  function satFrameFailed(k) {
+    const n = sat.frames.length;
+    const wasCurrent = sat.index === k;
+    const newest = k === n - 1;
+    satRemoveLayer(k);
+    const floor = +sat.frames[n - 1] - SAT_FALLBACK_MAX_MS;
+    const older = newest && sat.fallbacks < SAT_FALLBACK_STEPS ? olderSatelliteTime(sat.avail, sat.frames[k], { notBefore: Math.max(floor, k > 0 ? +sat.frames[k - 1] + 1 : -Infinity) }) : null;
+    if (newest) sat.fallbacks++;
+    if (older) sat.frames[k] = older;
+    else {
+      sat.frames.splice(k, 1);
+      sat.layers.splice(k, 1);
+      sat.ready.splice(k, 1);
+      sat.tiles.splice(k, 1);
+      if (sat.index > k) sat.index--;
+    }
+    if (!sat.frames.length) {
+      sat.failed = true;
+      sat.index = -1;
+      satPause();
+      return satUpdateUi();
+    }
+    if (wasCurrent || sat.index >= sat.frames.length) {
+      sat.index = -1;
+      satShow(sat.frames.length - 1);
+    } else satUpdateUi();
   }
 
   /** Show frame i. The previous frame stays visible until i has loaded, so scrubbing never flashes blank. */
@@ -962,7 +1059,9 @@ export function createMap(el, options = {}) {
     const hideOthers = () => {
       if (sat.index !== k) return;
       sat.layers.forEach((l, j) => {
-        if (l && j !== k) l.setOpacity(0);
+        if (!l || j === k) return;
+        if (sat.playing) l.setOpacity(0);
+        else satRemoveLayer(j);
       });
     };
     if (sat.ready[k] || !layerState.satellite) hideOthers();
@@ -1017,12 +1116,16 @@ export function createMap(el, options = {}) {
   }
 
   function satPause() {
-    const was = sat.playing;
+    const was = sat.playing || sat.loading;
     sat.playing = false;
     sat.loading = false;
     clearTimeout(sat.timer);
     if (was) {
       setStatus('');
+      // Keep only the frame on screen: hidden frames would reload on every zoom, pan or tab switch.
+      sat.layers.forEach((l, j) => {
+        if (l && j !== sat.index) satRemoveLayer(j);
+      });
       satUpdateUi();
     }
   }
@@ -1038,10 +1141,14 @@ export function createMap(el, options = {}) {
     return minutes < 120 ? t('map.ago.minutes', { n: num(minutes) }) : t('map.ago.hours', { n: num(Math.round(minutes / 60)) });
   }
 
+  /** The frame on screen has loaded but not one of its images arrived. */
+  const satShownEmpty = () => sat.index >= 0 && sat.ready[sat.index] && sat.tiles[sat.index]?.ok === 0 && sat.tiles[sat.index]?.bad > 0;
+
   function satUpdateUi() {
     const n = sat.frames.length;
     const onMap = layerState.satellite && activeTab === 'map';
-    const canMove = onMap && n >= 2;
+    const broken = sat.failed || satShownEmpty();
+    const canMove = onMap && n >= 2 && !broken;
     const mode = reduced() ? 'step' : sat.playing ? 'pause' : 'play';
     ui.play.disabled = !canMove;
     ui.play.dataset.mode = mode;
@@ -1056,7 +1163,7 @@ export function createMap(el, options = {}) {
     let text;
     let valueText = '';
     if (!layerState.satellite) text = t('map.sat.off');
-    else if (!n || sat.index < 0) text = sat.refreshing ? t('map.sat.loading') : t('map.sat.unavailable');
+    else if (broken || !n || sat.index < 0) text = sat.refreshing && !broken ? t('map.sat.loading') : t('map.sat.unavailable');
     else {
       const d = sat.frames[sat.index];
       valueText = fTime(d);
@@ -1147,17 +1254,34 @@ export function createMap(el, options = {}) {
         keyboard: false,
       });
       label.on('add', placeLabels);
-      ringLabels.push(label);
+      ringLabels.push({ marker: label, km });
       label.addTo(groups.rings);
     }
   }
 
   // --- data layers: systems and DMH --------------------------------------------------
+  // The popup the reader opened survives a data refresh (it is rebuilt with fresh content).
+  let openPopupId = null;
+  let rebuilding = false;
+  const markerByEl = new Map();
+  const dmhMarkers = [];
+
+  /** Tooltip content as a DOM node: storm names come from external feeds and must never be parsed as HTML. */
+  const tipText = (text) => () => h('span', { text });
+
+  /** Paths with a tooltip become Tab stops in Chromium; the same information is in the cards and popups. */
+  const noTab = (layer) => layer.on('add', () => layer.getElement?.()?.setAttribute('tabindex', '-1'));
+
   function renderData() {
+    const focusInPopup = Boolean(globalThis.document?.activeElement?.closest?.('.leaflet-popup') && el.contains(globalThis.document.activeElement));
+    rebuilding = true;
     groups.tracks.clearLayers();
     groups.wind.clearLayers();
     markersGroup.clearLayers();
+    rebuilding = false;
     markerById.clear();
+    markerByEl.clear();
+    dmhMarkers.length = 0;
     labelled.length = 0;
     const now = nowFn();
     for (const a of data.analyses) {
@@ -1173,10 +1297,19 @@ export function createMap(el, options = {}) {
       console.warn('[map] could not draw the DMH position', err);
     }
     placeLabels();
+    const reopen = openPopupId === 'dmh' ? dmhMarkers[0] : markerById.get(openPopupId)?.marker;
+    if (reopen) {
+      // Reopen without panning: a background refresh must not move the map.
+      const popup = reopen.getPopup();
+      if (popup) popup.options.autoPan = false;
+      reopen.openPopup();
+      if (popup) popup.options.autoPan = true;
+      if (focusInPopup) popup?.getElement?.()?.querySelector('.ymap-pop-title')?.focus({ preventScroll: true });
+    } else openPopupId = null;
   }
 
   function systemLabel(s) {
-    return String(s?.name || s?.designation || '').trim() || '—';
+    return systemName(s?.name || s?.designation || '', t) || '—';
   }
 
   function drawSystem(a, now) {
@@ -1191,7 +1324,7 @@ export function createMap(el, options = {}) {
     // Forecast cone.
     const cone = geometryToPolygons(s.cone?.geometry, ref);
     if (cone.length) {
-      L.polygon(cone, {
+      const conePoly = L.polygon(cone, {
         pane: PANE.overlays,
         className: 'ymap-cone',
         color: '#52514e',
@@ -1200,28 +1333,26 @@ export function createMap(el, options = {}) {
         dashArray: '5 5',
         fillOpacity: CONE_FILL_OPACITY,
       })
-        .bindTooltip(t('map.cone', { label }), { sticky: true, className: 'ymap-tip' })
-        .addTo(groups.tracks);
+        .bindTooltip(tipText(t('map.cone', { label })), { sticky: true, className: 'ymap-tip' });
+      noTab(conePoly).addTo(groups.tracks);
     }
 
-    // Wind areas: union per strength of every area valid from now on.
+    // Wind areas: union per strength of every area describing the storm now or later.
     const active = activeWindAreas(s.windAreas, now);
     for (const kmh of WIND_STRENGTHS) {
       const rings = unionRings(active[kmh].map((w) => w.feature.geometry), ref);
       if (!rings.length) continue;
-      L.polygon(
+      const area = L.polygon(
         rings.map((r) => [r]),
         {
           pane: PANE.overlays,
           className: `ymap-wind ymap-wind-${kmh}`,
-          weight: 1.25,
-          opacity: 0.75,
+          stroke: false,
           fillOpacity: WIND_FILL_OPACITY[kmh],
           fillRule: 'nonzero',
         },
-      )
-        .bindTooltip(t('map.windArea', { label, wind: fWind(kmh) }), { sticky: true, className: 'ymap-tip' })
-        .addTo(groups.wind);
+      ).bindTooltip(tipText(t('map.windArea', { label, wind: fWind(kmh) })), { sticky: true, className: 'ymap-tip' });
+      noTab(area).addTo(groups.wind);
     }
 
     // JTWC formation-alert corridor with a direction arrow.
@@ -1231,9 +1362,11 @@ export function createMap(el, options = {}) {
       const to = { lat: tcfa.to.lat, lon: unwrapLon(tcfa.to.lon, from.lon) };
       const band = corridorPolygon(from, to, tcfa.halfWidthKm);
       if (band.length) {
-        L.polygon(band, { pane: PANE.overlays, className: 'ymap-tcfa', weight: 1.5, opacity: 0.9, dashArray: '6 4', fillOpacity: 0.14 })
-          .bindTooltip(t('map.tcfa', { label }), { sticky: true, className: 'ymap-tip' })
-          .addTo(groups.tracks);
+        const corridor = L.polygon(band, { pane: PANE.overlays, className: 'ymap-tcfa', weight: 1.5, opacity: 0.9, dashArray: '6 4', fillOpacity: 0.14 }).bindTooltip(
+          tipText(t('map.tcfa', { label })),
+          { sticky: true, className: 'ymap-tip' },
+        );
+        noTab(corridor).addTo(groups.tracks);
         const axisOpts = { pane: PANE.tracks, className: 'ymap-tcfa-axis', weight: 2.5, opacity: 0.95, interactive: false, lineCap: 'round', lineJoin: 'round' };
         L.polyline(unwrapPath([from, to], from.lon), axisOpts).addTo(groups.tracks);
         L.polyline(arrowHead(from, to), axisOpts).addTo(groups.tracks);
@@ -1281,7 +1414,7 @@ export function createMap(el, options = {}) {
         strength: t(key),
         wind: isFiniteNum(p.windKt) ? fWind(p.windKt * KT_TO_KMH) : '',
       };
-      L.circleMarker([p.lat, lon], {
+      const dot = L.circleMarker([p.lat, lon], {
         pane: PANE.tracks,
         className: 'ymap-pt',
         radius: 5,
@@ -1289,9 +1422,8 @@ export function createMap(el, options = {}) {
         color: '#fcfcfb',
         fillColor: INTENSITY_COLORS[key] ?? INTENSITY_COLORS['imd.low'],
         fillOpacity: 1,
-      })
-        .bindTooltip(t(params.wind ? 'map.point' : 'map.point.noWind', params), { className: 'ymap-tip', direction: 'top', offset: [0, -6] })
-        .addTo(groups.tracks);
+      }).bindTooltip(tipText(t(params.wind ? 'map.point' : 'map.point.noWind', params)), { className: 'ymap-tip', direction: 'top', offset: [0, -6] });
+      noTab(dot).addTo(groups.tracks);
     }
 
     // Current position.
@@ -1301,19 +1433,48 @@ export function createMap(el, options = {}) {
       s.kind === 'invest' && s.potential ? t('map.invest', { label, chance: t(`jtwc.potential.${s.potential}`) }) : label;
     const iconEl = h('div', { class: 'ymap-sys' }, h('span', { class: 'ymap-sys-glyph', html: glyphSvg(color) }), h('span', { class: 'ymap-label ymap-sys-label', text: tag }));
     const aria = t('map.system.label', { label, kind, where });
+    // 44 px tap target around the 34 px glyph.
     const marker = L.marker(pos, {
-      icon: L.divIcon({ className: 'ymap-sys-icon', html: iconEl, iconSize: [34, 34], iconAnchor: [17, 17], popupAnchor: [0, -14] }),
+      icon: L.divIcon({ className: 'ymap-sys-icon', html: iconEl, iconSize: [44, 44], iconAnchor: [22, 22], popupAnchor: [0, -18] }),
       pane: PANE.markers,
       keyboard: true,
       riseOnHover: true,
       zIndexOffset: 100,
-    })
-      .bindPopup(() => systemPopup(a), { className: 'ymap-popup', maxWidth: 300, autoPanPadding: [16, 16] });
-    marker.on('add', () => marker.getElement()?.setAttribute('aria-label', aria));
+    }).bindPopup(() => systemPopup(a), { className: 'ymap-popup', maxWidth: 300, autoPanPadding: [16, 16], pane: PANE.popup });
+    trackPopup(marker, s.id);
+    marker.on('add', () => {
+      const node = marker.getElement();
+      node?.setAttribute('aria-label', aria);
+      if (node) markerByEl.set(node, marker);
+    });
     marker.addTo(markersGroup);
     labelled.push({ marker, root: iconEl });
     markerById.set(s.id, { marker, analysis: a });
   }
+
+  /** Keep track of the open popup (reopened after a refresh) and give it a name and focus target. */
+  function trackPopup(marker, id) {
+    marker.on('popupopen', (ev) => {
+      openPopupId = id;
+      const node = ev.popup?.getElement?.();
+      const title = node?.querySelector('.ymap-pop-title');
+      if (node && title) {
+        if (!title.id) title.id = uid('ymap-pop-title');
+        title.tabIndex = -1;
+        node.setAttribute('role', 'dialog');
+        node.setAttribute('aria-labelledby', title.id);
+      }
+    });
+    marker.on('popupclose', () => {
+      if (rebuilding) return;
+      if (openPopupId === id) openPopupId = null;
+      const back = focusReturn;
+      focusReturn = null;
+      const active = globalThis.document?.activeElement;
+      if (back && (!active || active === globalThis.document.body || el.contains(active))) back.focus?.({ preventScroll: true });
+    });
+  }
+  let focusReturn = null;
 
   function popupRoot(title, subtitle) {
     const root = h('div', { class: 'ymap-pop', lang });
@@ -1336,16 +1497,28 @@ export function createMap(el, options = {}) {
       lines.push(t('map.popup.closest', { dist: fDist(c.distanceKm), when: fDateTime(c.time) }));
     }
     if (s.potential && (s.kind === 'invest' || s.kind === 'tcfa')) lines.push(t('map.popup.potential', { chance: t(`jtwc.potential.${s.potential}`) }));
-    if (s.tcfa && timeMs(s.tcfa.validUntil) !== null) lines.push(t('map.popup.validUntil', { when: fDateTime(s.tcfa.validUntil) }));
-    const sources = (Array.isArray(s.sources) ? s.sources : []).map((x) => String(x).toUpperCase()).join(', ');
+    const until = s.kind === 'tcfa' ? timeMs(s.tcfa?.validUntil) : null;
+    // Same wording as the storm card: once the time has passed, say JTWC's update has not arrived.
+    if (until !== null) lines.push(t(until >= +nowFn() ? 'map.popup.validUntil' : 'map.popup.validLapsed', { when: fDateTime(until) }));
+    const sources = (Array.isArray(s.sources) ? s.sources : []).map((x) => String(x).toUpperCase()).join(t('map.popup.listSep'));
     if (sources) lines.push(t('map.popup.sources', { list: sources }));
     root.append(h('ul', { class: 'ymap-pop-list' }, ...lines.map((text) => h('li', { text }))));
     return root;
   }
 
   function drawDmh() {
-    const b = data.dmh?.bulletin;
-    if (!b?.isCurrent || !validLatLon(b)) return;
+    const list = Array.isArray(data.dmh?.inForce) && data.dmh.inForce.length ? data.dmh.inForce : [data.dmh?.bulletin];
+    const seen = new Set();
+    for (const b of list) {
+      if (!b?.isCurrent || !validLatLon(b)) continue;
+      const key = `${b.lat.toFixed(2)},${b.lon.toFixed(2)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      drawDmhMarker(b);
+    }
+  }
+
+  function drawDmhMarker(b) {
     const lon = unwrapLon(b.lon, home.lon);
     const swatch = DMH_STAGES[b.stage]?.swatch ?? null;
     const badge = h('span', { class: 'ymap-dmh-badge' });
@@ -1366,10 +1539,15 @@ export function createMap(el, options = {}) {
       keyboard: true,
       riseOnHover: true,
       zIndexOffset: 500,
-    })
-      .bindPopup(() => dmhPopup(b, where), { className: 'ymap-popup', maxWidth: 300, autoPanPadding: [16, 16] });
-    marker.on('add', () => marker.getElement()?.setAttribute('aria-label', aria));
+    }).bindPopup(() => dmhPopup(b, where), { className: 'ymap-popup', maxWidth: 300, autoPanPadding: [16, 16], pane: PANE.popup });
+    trackPopup(marker, 'dmh');
+    marker.on('add', () => {
+      const node = marker.getElement();
+      node?.setAttribute('aria-label', aria);
+      if (node) markerByEl.set(node, marker);
+    });
     marker.addTo(markersGroup);
+    dmhMarkers.push(marker);
   }
 
   function dmhPopup(b, where) {
@@ -1414,50 +1592,153 @@ export function createMap(el, options = {}) {
     fitTo(fitPoints(data.analyses, data.dmh, home, nowFn()));
   }
 
-  // Labels sit right of their marker; near the right edge they flip left so
-  // a storm name is never cut off.
+  // Storm labels sit right of their marker, else left, above or below —
+  // whichever side keeps them inside the map and off Yangon's name, the DMH
+  // badge and other labels. Distance-ring labels then take the first free
+  // spot along their ring (or hide): a storm name always wins over "300 km".
   const labelled = [];
   const ringLabels = [];
+  const SIDE_CLASS = { right: null, left: 'ymap-flip', above: 'ymap-above', below: 'ymap-below' };
   function placeLabels() {
     if (!viewSet || !el.clientWidth) return;
     const width = el.clientWidth;
-    const homePt = map.latLngToLayerPoint([home.lat, home.lon]);
-    for (const marker of ringLabels) {
-      const node = marker.getElement();
-      if (node) node.style.visibility = map.latLngToLayerPoint(marker.getLatLng()).distanceTo(homePt) < RING_LABEL_MIN_PX ? 'hidden' : '';
-    }
+    const height = el.clientHeight;
+    const base = el.getBoundingClientRect();
+    const boxOf = (node) => {
+      const r = node?.getBoundingClientRect?.();
+      if (!r || (!r.width && !r.height)) return null;
+      return { l: r.left - base.left, t: r.top - base.top, r: r.right - base.left, b: r.bottom - base.top, node };
+    };
+    const hit = (a, b) => a.l < b.r + 2 && b.l < a.r + 2 && a.t < b.b + 2 && b.t < a.b + 2;
+    const inside = (a) => a.l >= 4 && a.t >= 4 && a.r <= width - 4 && a.b <= height - 4;
+    const fixed = [...el.querySelectorAll('.ymap-home-label, .ymap-home-pin, .ymap-dmh-dot, .ymap-dmh-badge, .ymap-sys-glyph')].map(boxOf).filter(Boolean);
+    const placed = [];
+
     for (const { marker, root } of labelled) {
       const label = root.querySelector('.ymap-label');
       if (!label || !marker._map) continue;
-      const x = map.latLngToContainerPoint(marker.getLatLng()).x;
-      root.classList.toggle('ymap-flip', x + 24 + label.offsetWidth > width - 8 && x - 24 - label.offsetWidth > 8);
+      const pt = map.latLngToContainerPoint(marker.getLatLng());
+      const onScreen = pt.x > -60 && pt.y > -60 && pt.x < width + 60 && pt.y < height + 60;
+      let best = null;
+      for (const side of onScreen ? LABEL_SIDES : ['right']) {
+        for (const c of Object.values(SIDE_CLASS)) if (c) root.classList.remove(c);
+        if (SIDE_CLASS[side]) root.classList.add(SIDE_CLASS[side]);
+        const box = boxOf(label);
+        if (!box) break;
+        const clashes = [...fixed, ...placed].filter((b) => !root.contains(b.node) && hit(box, b)).length + (inside(box) ? 0 : 2);
+        if (!best || clashes < best.clashes) best = { side, box, clashes };
+        if (clashes === 0) break;
+      }
+      if (!best) continue;
+      for (const c of Object.values(SIDE_CLASS)) if (c) root.classList.remove(c);
+      if (SIDE_CLASS[best.side]) root.classList.add(SIDE_CLASS[best.side]);
+      placed.push(best.box);
+    }
+
+    const homePt = map.latLngToContainerPoint([home.lat, home.lon]);
+    for (const ring of ringLabels) {
+      const node = ring.marker.getElement();
+      if (!node || !ring.marker._map) continue;
+      const labelEl = node.querySelector('.ymap-ring-label') ?? node;
+      let chosen = null;
+      for (const bearing of RING_LABEL_BEARINGS) {
+        const at = destinationPoint(home, bearing, ring.km);
+        ring.marker.setLatLng([at.lat, at.lon]);
+        // Zoomed out, the ring is too small for a label.
+        if (map.latLngToContainerPoint([at.lat, at.lon]).distanceTo(homePt) < RING_LABEL_MIN_PX) break;
+        const box = boxOf(labelEl);
+        if (box && inside(box) && ![...fixed, ...placed].some((b) => hit(box, b))) {
+          chosen = box;
+          break;
+        }
+      }
+      node.style.visibility = chosen ? '' : 'hidden';
+      if (chosen) placed.push(chosen);
+    }
+
+    // A storm glyph on top of the DMH dot: the storm stays tappable (DMH keeps its badge).
+    for (const m of dmhMarkers) {
+      const dot = boxOf(m.getElement()?.querySelector('.ymap-dmh-dot'));
+      const covered = dot && [...el.querySelectorAll('.ymap-sys-glyph')].some((g) => {
+        const b = boxOf(g);
+        return b && hit(dot, b);
+      });
+      m.setZIndexOffset(covered ? 50 : 500);
     }
   }
   map.on('zoomend moveend resize', placeLabels);
 
   // --- interaction -------------------------------------------------------------
   // Scroll-wheel zoom (and one-finger panning on touch screens) only once the
-  // map has been clicked or focused, so the page scrolls past it normally.
-  const engage = () => {
-    map.scrollWheelZoom.enable();
-    if (coarse) map.dragging.enable();
-  };
-  map.on('click', engage);
-  on(el, 'focusin', engage);
-  on(el, 'focusout', (ev) => {
-    if (el.contains(ev.relatedTarget)) return;
+  // map has been clicked or focused, so the page scrolls past it normally. On
+  // touch screens that lasts only while the reader is using the map: a tap on
+  // a storm (to read it) does not capture page scrolling, and a few idle
+  // seconds, scrolling the map away or leaving it hands scrolling back.
+  let idleTimer = 0;
+  const disengage = () => {
+    clearTimeout(idleTimer);
     map.scrollWheelZoom.disable();
     if (coarse) map.dragging.disable();
+    el.classList.remove('ymap-engaged');
+  };
+  const touchIdle = () => {
+    clearTimeout(idleTimer);
+    if (coarse && map.dragging.enabled()) idleTimer = setTimeout(disengage, TOUCH_ENGAGE_IDLE_MS);
+  };
+  const engage = () => {
+    map.scrollWheelZoom.enable();
+    if (coarse) {
+      map.dragging.enable();
+      el.classList.add('ymap-engaged');
+      touchIdle();
+    }
+  };
+  const onMarkerOrPopup = (target) => Boolean(target?.closest?.('.leaflet-marker-icon, .leaflet-popup, .leaflet-control, .leaflet-interactive'));
+  map.on('click', (ev) => {
+    if (!onMarkerOrPopup(ev.originalEvent?.target)) engage();
+  });
+  on(el, 'focusin', (ev) => {
+    // Keyboard focus on the map itself (not a marker or popup inside it).
+    if (ev.target === el || !coarse) engage();
+  });
+  on(el, 'focusout', (ev) => {
+    if (el.contains(ev.relatedTarget)) return;
+    disengage();
   });
   on(el, 'mouseleave', () => map.scrollWheelZoom.disable());
+  on(el, 'touchend', touchIdle, { passive: true });
+  map.on('dragend zoomend', touchIdle);
+  map.on('popupclose', () => {
+    if (coarse && !rebuilding) disengage();
+  });
   const markUser = () => {
     userMoved = true;
   };
   on(el, 'pointerdown', markUser, { passive: true });
   on(el, 'keydown', markUser);
   on(el, 'wheel', () => map.scrollWheelZoom.enabled() && markUser(), { passive: true });
+  // Space presses map "buttons" (zoom, markers) like any button, and never scrolls the page away.
+  on(el, 'keydown', (ev) => {
+    if (ev.key !== ' ' && ev.key !== 'Spacebar') return;
+    const target = ev.target;
+    if (!(target instanceof Element) || target === el) return;
+    const marker = markerByEl.get(target);
+    if (marker) {
+      ev.preventDefault();
+      focusReturn = target;
+      marker.openPopup();
+    } else if (target.getAttribute('role') === 'button' && target.tagName !== 'BUTTON') {
+      ev.preventDefault();
+      target.click();
+    }
+  });
+  // Enter on a marker opens its popup (Leaflet): remember where to return focus.
+  on(el, 'keydown', (ev) => {
+    if (ev.key === 'Enter' && markerByEl.has(ev.target)) focusReturn = ev.target;
+  });
   on(globalThis.document, 'visibilitychange', () => {
     if (globalThis.document?.hidden) satPause();
+    else if (sat.stale && layerState.satellite) satRefresh();
   });
   const onMotionChange = () => {
     if (reduced()) satPause();
@@ -1477,6 +1758,21 @@ export function createMap(el, options = {}) {
       ro.disconnect();
     });
   }
+  if (typeof globalThis.IntersectionObserver === 'function') {
+    const io = new globalThis.IntersectionObserver(
+      (entries) => {
+        const entry = entries[entries.length - 1];
+        mapInView = entry.isIntersecting;
+        // Scrolled mostly away: page scrolling is the reader's again.
+        if (entry.intersectionRatio < 0.5 && coarse) disengage();
+        if (mapInView && sat.stale && layerState.satellite && Date.now() - sat.fetchedAt > SAT_REFRESH_MS) satRefresh();
+      },
+      { threshold: [0, 0.5] },
+    );
+    io.observe(el);
+    cleanups.push(() => io.disconnect());
+  }
+  cleanups.push(() => clearTimeout(idleTimer));
 
   // --- controller ------------------------------------------------------------------
   const controller = {
@@ -1489,8 +1785,9 @@ export function createMap(el, options = {}) {
       data = { analyses: Array.isArray(analyses) ? analyses.filter(Boolean) : [], dmh: dmh ?? null };
       renderData();
       if (!userMoved) autoFit();
+      // New satellite frames only while the map can be seen (satRefresh marks them stale otherwise).
       if (layerState.satellite && !sat.playing && Date.now() - sat.fetchedAt > SAT_REFRESH_MS) satRefresh();
-      if (layerState.radar) radarRefresh();
+      if (layerState.radar && mapVisible()) radarRefresh();
       radarUpdateUi();
     },
 
@@ -1509,14 +1806,19 @@ export function createMap(el, options = {}) {
       buildMapControls();
       applyText();
       renderStatic();
+      // An open popup is rebuilt in the new language (renderData reopens it).
       renderData();
       satUpdateUi();
       radarUpdateUi();
-      map.closePopup();
     },
 
-    /** Zoom to one system (by TropicalSystem id) and open its popup. Returns false if it is not on the map. */
-    focusSystem(id) {
+    /**
+     * Zoom to one system (by TropicalSystem id) and open its popup. With
+     * `moveFocus`, keyboard / screen-reader focus moves into the popup and
+     * returns to `returnFocus` (e.g. the "Show on map" button) when it closes.
+     * Returns false if the system is not on the map.
+     */
+    focusSystem(id, { moveFocus = false, returnFocus = null } = {}) {
       if (destroyed) return false;
       const entry = markerById.get(id);
       if (!entry) return false;
@@ -1525,7 +1827,9 @@ export function createMap(el, options = {}) {
       const pts = systemFitPoints(entry.analysis, home, nowFn());
       if (isFiniteNum(entry.analysis.distanceKm) && entry.analysis.distanceKm <= FOCUS_WITH_HOME_KM) pts.push([home.lat, home.lon]);
       fitTo(pts);
+      focusReturn = returnFocus ?? null;
       entry.marker.openPopup();
+      if (moveFocus) entry.marker.getPopup()?.getElement?.()?.querySelector('.ymap-pop-title')?.focus({ preventScroll: true });
       return true;
     },
 
@@ -1574,9 +1878,16 @@ export function createMap(el, options = {}) {
   radarUpdateUi();
   if (layerState.satellite) satRefresh();
   if (layerState.radar) radarRefresh();
-  setTimeout(() => {
-    if (!destroyed && !viewSet) fitTo([]);
-  }, 0);
+  // Without data yet, wait a little for the first setData() before falling
+  // back to the default view, so tiles for a view about to be replaced are
+  // not downloaded (`initialViewDelayMs`, 0 = next tick).
+  const initialView = setTimeout(
+    () => {
+      if (!destroyed && !viewSet) fitTo([]);
+    },
+    Math.max(0, Number(options.initialViewDelayMs) || 0),
+  );
+  cleanups.push(() => clearTimeout(initialView));
 
   return controller;
 }

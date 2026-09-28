@@ -12,11 +12,8 @@ on:
     - cron: '7,37 * * * *'
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-  actions: write
+# Each job gets only what it needs (below).
+permissions: {}
 
 concurrency:
   group: pages
@@ -27,6 +24,9 @@ jobs:
     name: Check Pages setup
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      pages: read # read the Pages source
+      actions: write # the weekly keep-alive re-enables this workflow
     outputs:
       enabled: ${{ steps.source.outputs.enabled }}
     steps:
@@ -36,13 +36,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          build_type="$(gh api "repos/${REPO}/pages" --jq .build_type 2>/dev/null || true)"
+          # gh prints an error body instead of the --jq result on HTTP errors,
+          # so read stderr to tell "not configured" (404) from a passing API hiccup.
+          err="$RUNNER_TEMP/pages.err"
+          build_type=error
+          for attempt in 1 2 3; do
+            if out="$(gh api "repos/${REPO}/pages" --jq .build_type 2>"$err")"; then build_type="$out"; break; fi
+            if grep -q 'HTTP 404' "$err"; then build_type=none; break; fi
+            [ "$attempt" -lt 3 ] && sleep 10
+          done
           if [ "$build_type" = "workflow" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif [ "$build_type" = "error" ]; then
+            # Could not tell: deploy anyway (an emergency data/override.json must
+            # not wait for the next run); deploy-pages fails loudly if Pages is off.
+            echo "::warning title=Pages check failed::$(tr '\n' ' ' < "$err") — deploying anyway."
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             # A notice, not a failure: this runs every 30 minutes and must not
             # send a failure email each time before Pages is configured.
-            echo "::notice title=Site not deployed::GitHub Pages is not set to deploy from GitHub Actions (current source: ${build_type:-none}). In the repository open Settings → Pages → Source: GitHub Actions. Until then this workflow skips fetching DMH data and deploying."
+            echo "::notice title=Site not deployed::GitHub Pages is not set to deploy from GitHub Actions (current source: ${build_type}). In the repository open Settings → Pages → Source: GitHub Actions. Until then this workflow skips fetching DMH data and deploying."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -67,19 +80,41 @@ jobs:
     if: needs.check.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false # nothing after checkout uses git
 
       - uses: actions/setup-node@v6
         with:
           node-version: 22
 
+      # Offline, pinned clock (~2 s). A failing suite stops the deploy on every
+      # run, the schedule included: the last good site stays live, and it
+      # already marks an old DMH bulletin as stale.
+      - name: Unit tests
+        run: npm test
+
       - name: Configure Pages
         id: pages
         uses: actions/configure-pages@v6
+
+      # The last data/dmh.json travels in the Actions cache, so keeping the
+      # previous bulletin through a DMH outage does not depend on the public
+      # site (DNS, CDN, custom domain) being reachable from the runner.
+      - name: Restore last DMH data
+        uses: actions/cache/restore@v6
+        with:
+          path: data/dmh.json
+          key: dmh-${{ github.run_id }}
+          restore-keys: dmh-
 
       # Never blocks the deploy: on failure the script keeps the previously
       # deployed bulletin (ok:false, old checkedAt) and the site shows it as stale.
@@ -88,7 +123,27 @@ jobs:
         timeout-minutes: 5
         env:
           PREVIOUS_URL: ${{ steps.pages.outputs.base_url }}/data/dmh.json?run=${{ github.run_id }}
-        run: node scripts/fetch-dmh.mjs --out data/dmh.json --previous "$PREVIOUS_URL"
+        run: |
+          prev=data/dmh.json
+          [ -s "$prev" ] || prev="$PREVIOUS_URL"
+          node scripts/fetch-dmh.mjs --out data/dmh.json --previous "$prev"
+
+      - name: Save DMH data
+        if: always() && hashFiles('data/dmh.json') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: data/dmh.json
+          key: dmh-${{ github.run_id }}
+
+      # A killed or crashed fetch must not deploy a site without data/dmh.json
+      # (the page would say "cannot read DMH" instead of "check is stale").
+      - name: Make sure data/dmh.json exists
+        run: |
+          if [ ! -s data/dmh.json ]; then
+            echo "::warning title=No DMH data::fetch-dmh wrote nothing; deploying an empty, failed check."
+            mkdir -p data
+            printf '{"schema":1,"generator":"scripts/fetch-dmh.mjs","checkedAt":null,"attemptedAt":"%s","ok":false,"errors":["fetch-dmh did not run to completion"],"cyclone":null,"recentCyclone":[],"announcement":null,"otherWarnings":[]}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > data/dmh.json
+          fi
 
       - name: Assemble site
         run: |

@@ -19,6 +19,8 @@ const KIND_RANK = { warning: 3, tcfa: 2, invest: 1 };
 // An invest this close to a warned system (in space and time) is that system.
 const SAME_SYSTEM_KM = 300;
 const SAME_SYSTEM_HOURS = 24;
+// Two fixes this close (degrees) are the same fix repeated.
+const SAME_FIX_DEG = 0.1;
 const FETCH_OPTS = { cache: 'no-cache' };
 
 // "14.4N 98.0E" (also tolerates "14.4 N 98.0 E").
@@ -77,6 +79,12 @@ function latLon(latS, ns, lonS, ew) {
 }
 
 const flat = (text) => String(text ?? '').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
+
+/** Storm name from a feed, as display text: markup and control characters dropped, title case. */
+function cleanName(raw) {
+  const s = String(raw ?? '').replace(/[<>\u0000-\u001f\u007f]/g, '').trim().slice(0, 40);
+  return s ? titleCase(s) : null;
+}
 
 /** WMO header, e.g. "WTPN31 PGTW 281500" → { header: 'WTPN31', issuedAt }. */
 function parseHeader(text, now) {
@@ -206,12 +214,15 @@ export function parseRss(xmlText) {
         title,
         kind,
         designation,
-        name: nameRaw ? titleCase(nameRaw) : null,
+        name: cleanName(nameRaw),
         issuedText: issued[1],
         textUrl: productUrl(textHref),
         graphicUrl: graphicHref ? productUrl(graphicHref) : null,
         final: /final warning/i.test(title),
         basinPrefix,
+        // Product file key ('io93', 'wp92'): identifies a product even when its designation letter is unknown.
+        productKey: `${basinPrefix}${file[2]}`,
+        cancelled: /cancel/i.test(title),
       });
     }
   }
@@ -261,7 +272,7 @@ export function parseWarningText(text, now = new Date()) {
   return blankSystem({
     id: `jtwc:${designation}`,
     kind: 'warning',
-    name: nameRaw ? titleCase(nameRaw) : designation,
+    name: cleanName(nameRaw) ?? designation,
     designation,
     basin: basinOf(header, designation, null),
     issuedAt,
@@ -359,9 +370,16 @@ export function parseAdvisoryText(text, now = new Date()) {
 function parseAdvisory(text, now) {
   const t = flat(text).toUpperCase();
   const { header, issuedAt } = parseHeader(t, now);
-  const tcfaRefs = new Set([...t.matchAll(/\bREF\s+([A-Z])\s+IS\s+A\s+TROPICAL\s+CYCLONE\s+FORMATION\s+ALERT/g)].map((m) => m[1]));
+  // "REF A IS A TROPICAL CYCLONE FORMATION ALERT" (but not "... ALERT CANCELLATION").
+  const tcfaRefs = new Set([...t.matchAll(/\bREF\s+([A-Z])\s+IS\s+A\s+TROPICAL\s+CYCLONE\s+FORMATION\s+ALERT\b(?!\s+CANCEL)/g)].map((m) => m[1]));
+  // "REF/A/MSG/.../271721ZSEP2026//": when each referenced message was issued (with its year).
+  const refTimes = new Map();
+  for (const m of t.matchAll(/\bREF\/([A-Z])\/(?:[^/]*\/)*?(\d{2})(\d{2})(\d{2})Z([A-Z]{3})(\d{4})\b/g)) {
+    const mo = MONTHS[m[5]];
+    if (mo !== undefined) refTimes.set(m[1], new Date(Date.UTC(+m[6], mo, +m[2], +m[3], +m[4])));
+  }
   const start = /(?:^|\s)1\.\s+[A-Z][A-Z ]*?AREA\b/.exec(t);
-  if (!start) return { systems: [], tcfaDesignations: [] };
+  if (!start) return { systems: [], tcfaDesignations: [], issuedAt, recognised: false };
   const rest = t.slice(start.index + start[0].length);
   const end = /\s2\.\s+[A-Z][A-Z ]*?AREA\b|\s3\.\s+JUSTIFICATION/.exec(rest);
   const section = end ? rest.slice(0, end.index) : rest;
@@ -388,9 +406,9 @@ function parseAdvisory(text, now) {
     if (!s) continue;
     systems.push(s);
     const ref = /\bSEE\s+REF\s+([A-Z])\b/.exec(it)?.[1];
-    if (s.designation && ref && tcfaRefs.has(ref)) tcfaDesignations.push(s.designation);
+    if (s.designation && ref && tcfaRefs.has(ref)) tcfaDesignations.push({ designation: s.designation, issuedAt: refTimes.get(ref) ?? issuedAt });
   }
-  return { systems, tcfaDesignations };
+  return { systems, tcfaDesignations, issuedAt, recognised: /^\s*AB[A-Z]{2}\d{2}\s+PGTW\s+\d{6}/.test(t) };
 }
 
 function parseTcSummary(it, header, issuedAt) {
@@ -410,7 +428,7 @@ function parseTcSummary(it, header, issuedAt) {
   return blankSystem({
     id: `jtwc:${designation}`,
     kind: 'warning',
-    name: m[2] ? titleCase(m[2].trim()) : designation,
+    name: cleanName(m[2]) ?? designation,
     designation,
     basin: basinOf(header, designation, null),
     issuedAt,
@@ -473,19 +491,34 @@ function combine(group) {
   best.final = sorted.some((s) => s.final && s.kind === 'warning');
   best.movement = best.movement ?? sorted.find((s) => s.movement)?.movement ?? null;
 
-  // Without a forecast track, a newer fix from another product is the better "now".
+  // Without a forecast track, a newer fix from another product is the better "now"
+  // — unless it only repeats an older fix's coordinates (an advisory reissued
+  // with the old text): then the older fix keeps its real time.
   const hasForecast = (best.track ?? []).some((p) => p.forecast);
   if (!hasForecast) {
-    const newestPos = [...group].sort((a, b) => ms(b.position?.time) - ms(a.position?.time))[0];
-    if (ms(newestPos.position?.time) > ms(best.position?.time)) {
+    const sameSpot = (a, b) => a && b && Math.abs(a.lat - b.lat) <= SAME_FIX_DEG && Math.abs(wrapLonDelta(a.lon - b.lon)) <= SAME_FIX_DEG;
+    const fixes = [...group].filter((s) => s.position).sort((a, b) => ms(b.position?.time) - ms(a.position?.time));
+    let newestPos = fixes[0];
+    if (newestPos) {
+      const firstAtSpot = [...fixes].reverse().find((s) => sameSpot(s.position, newestPos.position));
+      if (firstAtSpot) newestPos = { ...newestPos, position: firstAtSpot.position };
+    }
+    if (newestPos && ms(newestPos.position?.time) > ms(best.position?.time)) {
       best.position = newestPos.position;
       best.windKt = newestPos.windKt ?? best.windKt;
+    } else if (newestPos && sameSpot(newestPos.position, best.position) && ms(newestPos.position?.time) < ms(best.position?.time)) {
+      best.position = newestPos.position;
     }
     const seen = new Set();
-    best.track = group
-      .flatMap((s) => (s.track ?? []).filter((p) => !p.forecast))
-      .filter((p) => (seen.has(+p.time) ? false : seen.add(+p.time)))
-      .sort((a, b) => a.time - b.time);
+    const observed = [];
+    for (const p of group.flatMap((s) => (s.track ?? []).filter((q) => !q.forecast)).sort((a, b) => a.time - b.time)) {
+      if (seen.has(+p.time)) continue;
+      seen.add(+p.time);
+      // The same fix repeated later is not a second position.
+      if (observed.length && sameSpot(observed[observed.length - 1], p)) continue;
+      observed.push(p);
+    }
+    best.track = observed;
   }
   return best;
 }
@@ -525,8 +558,16 @@ function keep(s, home) {
 
 const errText = (e) => (e && e.message) || String(e);
 
+/** A real JTWC RSS document (a quiet feed may list no products at all). */
+const looksLikeRss = (text) => /<rss\b|<channel\b/i.test(String(text ?? '').slice(0, 5000));
+
 /**
  * Current JTWC systems relevant to South/South-East Asia. Never throws.
+ * `ok` means every product JTWC lists was read: the RSS (or, when it is
+ * down, both advisories and every formation alert they refer to), each
+ * warning / formation-alert text it lists, and both advisories. Anything
+ * less is `ok: false` with the systems that could be read kept, so the page
+ * records a gap instead of treating a partial read as full coverage.
  * @returns {Promise<{systems: object[], ok: boolean, error?: string, errors: string[]}>}
  */
 export async function fetchJtwc(now = new Date(), home = HOME) {
@@ -534,7 +575,9 @@ export async function fetchJtwc(now = new Date(), home = HOME) {
   try {
     let items = null;
     try {
-      items = parseRss(await fetchText(URLS.jtwcRss, FETCH_OPTS));
+      const text = await fetchText(URLS.jtwcRss, FETCH_OPTS);
+      if (!looksLikeRss(text)) throw new Error('not an RSS feed');
+      items = parseRss(text);
     } catch (err) {
       errors.push(`JTWC RSS: ${errText(err)}`);
     }
@@ -548,46 +591,67 @@ export async function fetchJtwc(now = new Date(), home = HOME) {
     );
 
     const run = async (task) => {
+      const file = task.url.split('/').pop();
       let text;
       try {
         text = await fetchText(task.url, FETCH_OPTS);
       } catch (err) {
-        errors.push(`JTWC ${task.url.split('/').pop()}: ${errText(err)}`);
+        errors.push(`JTWC ${file}: ${errText(err)}`);
         return { task, ok: false, systems: [] };
       }
-      return { task, ok: true, ...parseProduct(task, text, now) };
+      const parsed = parseProduct(task, text, now);
+      if (!parsed.recognised) {
+        errors.push(`JTWC ${file}: unrecognised content`);
+        return { task, ok: false, ...parsed };
+      }
+      return { task, ok: true, ...parsed };
     };
     const results = await mapLimit(tasks, MAX_IN_FLIGHT, run);
     const done = results.filter(Boolean);
 
     // RSS down: a formation alert an advisory refers to ("SEE REF A") still has a
     // predictable text URL, and that text carries the alert corridor.
+    const extraTasks = [];
     if (items === null) {
       const haveText = new Set(done.filter((r) => r.ok && r.task.type !== 'advisory').flatMap((r) => r.systems.map((x) => x.designation)));
-      const extra = [...new Set(done.flatMap((r) => r.tcfaDesignations ?? []))]
-        .filter((d) => d && !haveText.has(d))
-        .map((d) => productTextUrl(d, now))
-        .filter((url) => url && !tasks.some((task) => task.url === url))
-        .map((url) => ({ type: 'tcfa', url }));
-      if (extra.length) done.push(...(await mapLimit(extra, MAX_IN_FLIGHT, run)).filter(Boolean));
+      const refs = done.flatMap((r) => r.tcfaDesignations ?? []);
+      const seen = new Set();
+      for (const ref of refs) {
+        if (!ref?.designation || haveText.has(ref.designation) || seen.has(ref.designation)) continue;
+        seen.add(ref.designation);
+        const url = productTextUrl(ref.designation, ref.issuedAt ?? now);
+        if (url && !tasks.some((task) => task.url === url)) extraTasks.push({ type: 'tcfa', url });
+      }
+      if (extraTasks.length) done.push(...(await mapLimit(extraTasks, MAX_IN_FLIGHT, run)).filter(Boolean));
     }
     const advisoryOk = (key) => done.some((r) => r.task.key === key && r.ok);
-    const ok = items !== null || (advisoryOk('abio') && advisoryOk('abpw'));
+    const productsOk = done.filter((r) => r.task.type !== 'advisory').every((r) => r.ok);
+    const ok = advisoryOk('abio') && advisoryOk('abpw') && productsOk;
 
     let systems = dedupe(done.flatMap((r) => r.systems));
     // A TCFA listed in the RSS or referenced by an advisory is in force even
     // when its own text could not be fetched — unless we saw it cancelled.
-    const cancelled = new Set([
-      ...done.filter((r) => r.task.type === 'tcfa').flatMap((r) => r.systems.filter((s) => s.kind === 'invest').map((s) => s.designation)),
-      ...(items ?? []).filter((i) => i.kind === 'tcfa' && /cancel/i.test(i.title)).map((i) => i.designation),
-    ]);
+    // Products are also matched by file ("io93"), because a cancelled Bay of
+    // Bengal alert's RSS entry may not say its designation letter.
+    const keyOf = (designation) => {
+      const m = /^(\d{2})([A-Z])$/.exec(String(designation ?? ''));
+      return m && SUFFIX_PREFIX[m[2]] ? `${SUFFIX_PREFIX[m[2]]}${m[1]}` : null;
+    };
+    const rssTcfa = (items ?? []).filter((i) => i.kind === 'tcfa');
+    const cancelled = new Set(done.filter((r) => r.task.type === 'tcfa').flatMap((r) => r.systems.filter((s) => s.kind === 'invest').map((s) => s.designation)));
+    const cancelledKeys = new Set(rssTcfa.filter((i) => i.cancelled).map((i) => i.productKey));
+    for (const i of rssTcfa) if (i.cancelled && i.designation) cancelled.add(i.designation);
     const tcfaDesignations = new Set([
-      ...(items ?? []).filter((i) => i.kind === 'tcfa' && i.designation).map((i) => i.designation),
-      ...done.flatMap((r) => r.tcfaDesignations ?? []),
+      ...rssTcfa.filter((i) => !i.cancelled && i.designation).map((i) => i.designation),
+      ...done.flatMap((r) => (r.tcfaDesignations ?? []).map((x) => x.designation)),
     ]);
-    systems = systems.map((s) =>
-      s.kind === 'invest' && tcfaDesignations.has(s.designation) && !cancelled.has(s.designation) ? { ...s, kind: 'tcfa' } : s,
-    );
+    const tcfaKeys = new Set(rssTcfa.filter((i) => !i.cancelled).map((i) => i.productKey));
+    systems = systems.map((s) => {
+      if (s.kind !== 'invest' || !s.designation) return s;
+      const key = keyOf(s.designation);
+      if (cancelled.has(s.designation) || (key && cancelledKeys.has(key))) return s;
+      return tcfaDesignations.has(s.designation) || (key && tcfaKeys.has(key)) ? { ...s, kind: 'tcfa' } : s;
+    });
     systems = systems.filter((s) => keep(s, home));
 
     return ok
@@ -601,29 +665,40 @@ export async function fetchJtwc(now = new Date(), home = HOME) {
 // Designation suffix → JTWC product file prefix (92W → wp9226web.txt, 03B → io0326web.txt).
 const SUFFIX_PREFIX = { W: 'wp', B: 'io', A: 'io', S: 'sh', P: 'sh', E: 'ep', C: 'cp' };
 
-/** Text product URL for a designation in `now`'s year, or null (only basins we fetch). */
-function productTextUrl(designation, now) {
+/**
+ * Text product URL for a designation, or null (only basins we fetch). The
+ * file's two-digit year is that of the message referring to it (`issuedAt`),
+ * so an alert issued on 31 Dec is still found on 1 Jan.
+ */
+function productTextUrl(designation, issuedAt) {
   const m = /^(\d{2})([A-Z])$/.exec(String(designation ?? '').toUpperCase());
   const prefix = m ? SUFFIX_PREFIX[m[2]] : null;
   if (!prefix || !FETCH_PREFIXES.has(prefix)) return null;
-  const yy = String(now.getUTCFullYear() % 100).padStart(2, '0');
+  const at = issuedAt instanceof Date && !Number.isNaN(+issuedAt) ? issuedAt : new Date();
+  const yy = String(at.getUTCFullYear() % 100).padStart(2, '0');
   return `${URLS.jtwcProducts}${prefix}${m[1]}${yy}web.txt`;
 }
 
-/** @returns {{systems: object[], tcfaDesignations?: string[]}} */
+/**
+ * @returns {{systems: object[], tcfaDesignations?: Array<{designation: string, issuedAt: Date|null}>, recognised: boolean}}
+ *   `recognised` is false for anything that is not the JTWC product we asked
+ *   for (an HTML error page served with status 200, a truncated file…).
+ */
 function parseProduct(task, text, now) {
   try {
     if (task.type === 'advisory') {
-      const { systems, tcfaDesignations } = parseAdvisory(text, now);
-      return { systems: systems.map((s) => ({ ...s, links: { ...s.links, jtwcText: task.url } })), tcfaDesignations };
+      const { systems, tcfaDesignations, recognised } = parseAdvisory(text, now);
+      return { systems: systems.map((s) => ({ ...s, links: { ...s.links, jtwcText: task.url } })), tcfaDesignations, recognised };
     }
-    const isTcfa = /FORMATION ALERT/i.test(String(text).slice(0, 600));
+    const head = String(text).slice(0, 600);
+    const isTcfa = /FORMATION ALERT/i.test(head);
     const s = isTcfa ? parseTcfaText(text, now) : parseWarningText(text, now);
-    if (!s) return { systems: [] };
+    // A cancellation notice without a position is still a real, readable product.
+    if (!s) return { systems: [], recognised: isTcfa && /CANCEL/i.test(head) && /\bPGTW\b/.test(head) };
     const links = { jtwcText: task.url };
     if (task.item?.graphicUrl) links.jtwcGraphic = task.item.graphicUrl;
-    return { systems: [{ ...s, final: s.final || Boolean(task.item?.final && s.kind === 'warning'), links }] };
+    return { systems: [{ ...s, final: s.final || Boolean(task.item?.final && s.kind === 'warning'), links }], recognised: true };
   } catch {
-    return { systems: [] };
+    return { systems: [], recognised: false };
   }
 }

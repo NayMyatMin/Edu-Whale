@@ -2,7 +2,7 @@
 // contacts as tap-to-call buttons, and the official source links.
 
 import { CHECKLIST, EMERGENCY_CONTACTS, OFFICIAL_SOURCES, SURGE_TOWNSHIPS } from '../config.js';
-import { formatNumber, getLang, hasKey, t } from '../i18n.js';
+import { formatNumber, getLang, hasKey, localDigits, t } from '../i18n.js';
 import { extLink, fill, h, icon } from './dom.js';
 import { listFormat } from './status.js';
 
@@ -68,6 +68,15 @@ export function renderChecklist(el) {
     ),
   );
 
+  // "Start again" clears the ticks but offers an Undo for a while (a slip of
+  // the finger must not wipe saved progress).
+  const undoLine = h('p', { class: 'check-undo', role: 'status', hidden: true });
+  let undoTimer = 0;
+  const hideUndo = () => {
+    clearTimeout(undoTimer);
+    undoLine.hidden = true;
+    undoLine.replaceChildren();
+  };
   const reset = h(
     'button',
     {
@@ -75,22 +84,47 @@ export function renderChecklist(el) {
       class: 'btn btn-quiet btn-sm',
       on: {
         click: () => {
+          const prev = [...checked];
+          if (!prev.length) return;
           checked.clear();
           saveChecked(checked);
           for (const b of boxes) b.checked = false;
           update();
+          const undo = h(
+            'button',
+            {
+              type: 'button',
+              class: 'btn btn-secondary btn-sm',
+              on: {
+                click: () => {
+                  for (const id of prev) checked.add(id);
+                  saveChecked(checked);
+                  for (const b of boxes) b.checked = checked.has(b.dataset.id);
+                  update();
+                  hideUndo();
+                  reset.focus();
+                },
+              },
+            },
+            h('span', { text: t('check.undo') }),
+          );
+          undoLine.replaceChildren(h('span', { text: t('check.cleared', { n: formatNumber(prev.length) }) }), ' ', undo);
+          undoLine.hidden = false;
+          clearTimeout(undoTimer);
+          undoTimer = setTimeout(hideUndo, 15000);
         },
       },
     },
     icon('reset', { size: 18 }),
     h('span', { text: t('check.reset') }),
   );
+  for (const b of boxes) b.addEventListener('change', hideUndo);
 
   const townships = SURGE_TOWNSHIPS.map((name) => tOr(`township.${name}`, name));
   fill(
     el,
     h('p', { class: 'section-intro', text: t('prepare.intro') }),
-    h('div', { class: 'check-progress' }, progressText, meter, reset),
+    h('div', { class: 'check-progress' }, progressText, meter, reset, undoLine),
     h('div', { class: 'check-groups' }, groups),
     h(
       'aside',
@@ -126,7 +160,7 @@ export function renderContacts(el) {
             'a',
             { class: 'tel-btn', href: `tel:${c.tel}` },
             icon('phone', { size: 22 }),
-            h('span', { class: 'tel-num', text: c.number }),
+            h('span', { class: 'tel-num', text: localDigits(c.number) }),
             h('span', { class: 'tel-label', text: t(c.key) }),
           ),
           c.noteKey ? h('p', { class: 'tel-note', text: t(c.noteKey) }) : null,

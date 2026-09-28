@@ -2,7 +2,14 @@
 // - App shell (page, styles, scripts, dictionaries, Leaflet, font, icons) is
 //   precached so the checklist, phone numbers and last saved status open
 //   offline. Cache names carry APP_VERSION (registered as sw.js?v=<version>).
-// - Navigations and same-origin data/*.json: network first, cache fallback.
+//   The files the page needs to start are installed all-or-nothing: a failed
+//   download keeps the previous, complete version in charge.
+// - Same-origin app files and navigations: network first (revalidated, so a
+//   deploy is picked up at once and old and new modules never mix), the
+//   cached copy after a few seconds or offline.
+// - Same-origin data/*.json (DMH bulletins, the override): network only. The
+//   page keeps its own last copy and says how old it is; an old copy from here
+//   would be passed off as new.
 // - Open-Meteo / GDACS / JTWC: network first; a cached copy is used only while
 //   young (so an old forecast or storm list is never passed off as current).
 // - Map tiles (OSM, NASA GIBS, RainViewer) are never cached. Non-GET is ignored.
@@ -10,11 +17,12 @@
 const VERSION = new URL(self.location.href).searchParams.get('v') || 'dev';
 const PREFIX = 'ysw-';
 const SHELL_CACHE = `${PREFIX}shell-${VERSION}`;
-const DATA_CACHE = `${PREFIX}data-${VERSION}`;
 const API_CACHE = `${PREFIX}api-${VERSION}`;
-const CURRENT = new Set([SHELL_CACHE, DATA_CACHE, API_CACHE]);
+const CURRENT = new Set([SHELL_CACHE, API_CACHE]);
 
-const NAV_TIMEOUT_MS = 7000;
+// Network answers slower than this fall back to the cached copy (the network one still updates the cache).
+const APP_TIMEOUT_MS = 3000;
+const NAV_TIMEOUT_MS = 5000;
 const API_MAX_ENTRIES = 40;
 const STAMP = 'x-ysw-fetched-at';
 const HOUR = 3600e3;
@@ -77,19 +85,27 @@ const SHELL = [
   'js/dmh.js',
   'js/weather.js',
   'js/risk.js',
-  'data/override.json',
 ];
+
+// What the page needs to start (all-or-nothing); the rest (icons, images, the
+// demo data) is cached when it can be.
+const CRITICAL = SHELL.filter((p) => p === './' || (/\.(?:html|css|js|webmanifest)$/.test(p) && p !== 'js/demo.js'));
+const OPTIONAL = SHELL.filter((p) => !CRITICAL.includes(p));
+// Revalidate with the server (a 304 when unchanged), never trust the HTTP cache blindly.
+const fresh = (path) => new Request(path, { cache: 'no-cache' });
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
       const cache = await caches.open(SHELL_CACHE);
-      // One missing file must not stop the rest from being cached.
-      await Promise.all(
-        SHELL.map((path) =>
-          cache.add(new Request(path, { cache: 'reload' })).catch((err) => console.warn('[sw] not cached:', path, err?.message ?? err)),
-        ),
-      );
+      try {
+        await cache.addAll(CRITICAL.map(fresh));
+      } catch (err) {
+        // Incomplete: drop it and fail, so the previous worker and its complete cache stay.
+        await caches.delete(SHELL_CACHE);
+        throw err;
+      }
+      await Promise.all(OPTIONAL.map((path) => cache.add(fresh(path)).catch((err) => console.warn('[sw] not cached:', path, err?.message ?? err))));
       await self.skipWaiting();
     })(),
   );
@@ -98,8 +114,15 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
+      const shell = await caches.open(SHELL_CACHE);
+      const complete = (await Promise.all(CRITICAL.map((p) => shell.match(p)))).every(Boolean);
       const names = await caches.keys();
-      await Promise.all(names.filter((n) => n.startsWith(PREFIX) && !CURRENT.has(n)).map((n) => caches.delete(n)));
+      // Old shells go only once the new one is complete; old data/api caches always go.
+      await Promise.all(
+        names
+          .filter((n) => n.startsWith(PREFIX) && !CURRENT.has(n) && (complete || !n.startsWith(`${PREFIX}shell-`)))
+          .map((n) => caches.delete(n)),
+      );
       await self.clients.claim();
     })(),
   );
@@ -119,13 +142,9 @@ self.addEventListener('fetch', (event) => {
 
   if (url.origin === self.location.origin) {
     const scopePath = new URL(self.registration.scope).pathname;
-    if (request.mode === 'navigate') {
-      event.respondWith(navigation(event));
-    } else if (url.pathname.startsWith(`${scopePath}data/`) && url.pathname.endsWith('.json')) {
-      event.respondWith(networkFirst(request, DATA_CACHE));
-    } else if (!url.pathname.endsWith('/sw.js')) {
-      event.respondWith(staleWhileRevalidate(event));
-    }
+    if (request.mode === 'navigate') event.respondWith(navigation(event, url, scopePath));
+    else if (url.pathname.startsWith(`${scopePath}data/`)) return; // network only (see above)
+    else if (!url.pathname.endsWith('/sw.js')) event.respondWith(appFile(event));
     return;
   }
 
@@ -134,53 +153,56 @@ self.addEventListener('fetch', (event) => {
   // Anything else cross-origin (Windy embed, external links) goes straight to the network.
 });
 
-async function navigation(event) {
+const timeout = (ms) => new Promise((resolve) => setTimeout(() => resolve('timeout'), ms));
+
+/** A shell file from this version's cache, else from any version's (offline only). */
+async function cachedShell(request, cache) {
+  return (await cache.match(request)) || (await caches.match(request)) || null;
+}
+
+async function appFile(event) {
+  const { request } = event;
   const cache = await caches.open(SHELL_CACHE);
-  const network = fetch(event.request)
+  const network = fetch(new Request(request, { cache: 'no-cache' }))
     .then((res) => {
-      if (res.ok) cache.put(event.request, res.clone()).catch(() => {});
+      if (res.ok && res.type === 'basic') {
+        const copy = res.clone();
+        cache.put(request, copy).catch(() => {});
+      }
       return res;
     })
     .catch(() => null);
-  const timeout = new Promise((resolve) => setTimeout(() => resolve('timeout'), NAV_TIMEOUT_MS));
-  const first = await Promise.race([network, timeout]);
+  const first = await Promise.race([network, timeout(APP_TIMEOUT_MS)]);
+  if (first && first !== 'timeout' && first.ok) return first;
+  const cached = await cachedShell(request, cache);
+  if (cached) {
+    event.waitUntil(network);
+    return cached;
+  }
+  const late = first === 'timeout' ? await network : first;
+  return late || Response.error();
+}
+
+async function navigation(event, url, scopePath) {
+  const cache = await caches.open(SHELL_CACHE);
+  const isPage = url.pathname === scopePath || url.pathname === `${scopePath}index.html`;
+  // One copy of the page whatever the query string (?demo=…): each variant is the same HTML.
+  const key = new URL('./', self.registration.scope).href;
+  const network = fetch(event.request)
+    .then((res) => {
+      if (res.ok && isPage) cache.put(key, res.clone()).catch(() => {});
+      return res;
+    })
+    .catch(() => null);
+  const first = await Promise.race([network, timeout(NAV_TIMEOUT_MS)]);
   if (first && first !== 'timeout') return first;
-  const cached = (await cache.match(event.request, { ignoreSearch: true })) || (await cache.match('./')) || (await cache.match('index.html'));
+  const cached = isPage ? (await cache.match(key)) || (await cache.match('index.html')) || (await caches.match(key)) : null;
   if (cached) {
     event.waitUntil(network);
     return cached;
   }
   const late = await network;
   return late || new Response('Offline. Please check DMH: https://www.moezala.gov.mm/en/cyclone-news', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
-}
-
-async function networkFirst(request, cacheName) {
-  const cache = await caches.open(cacheName);
-  try {
-    const res = await fetch(request);
-    if (res.ok) await cache.put(request, res.clone());
-    return res;
-  } catch (err) {
-    const cached = await cache.match(request, { ignoreSearch: true });
-    if (cached) return cached;
-    throw err;
-  }
-}
-
-async function staleWhileRevalidate(event) {
-  const cache = await caches.open(SHELL_CACHE);
-  const cached = await cache.match(event.request);
-  const network = fetch(event.request)
-    .then((res) => {
-      if (res.ok && res.type === 'basic') cache.put(event.request, res.clone()).catch(() => {});
-      return res;
-    })
-    .catch(() => null);
-  if (cached) {
-    event.waitUntil(network);
-    return cached;
-  }
-  return (await network) || Response.error();
 }
 
 async function apiNetworkFirst(request, maxAgeMs) {

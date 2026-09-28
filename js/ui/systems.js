@@ -9,6 +9,8 @@ import {
   formatWhen,
   formatWind,
   formatWindKt,
+  listSep,
+  systemName,
   t,
 } from '../i18n.js';
 import { extLink, fill, h, icon, levelPill, notice } from './dom.js';
@@ -93,7 +95,7 @@ function systemCard(a, threat, now, ctx) {
     h(
       'header',
       { class: 'sys-head' },
-      h('h3', { class: 'sys-name', id: `sys-${cssId(s.id)}`, text: s.name || s.designation || t('sys.unnamed') }),
+      h('h3', { class: 'sys-name', id: `sys-${cssId(s.id)}`, text: systemName(s.name) || s.designation || t('sys.unnamed') }),
       h(
         'p',
         { class: 'sys-badges' },
@@ -174,10 +176,10 @@ function elsewhereList(list, now) {
         h(
           'li',
           {},
-          h('strong', { text: a.system.name || a.system.designation || t('sys.unnamed') }),
+          h('strong', { text: systemName(a.system.name) || a.system.designation || t('sys.unnamed') }),
           h(
             'span',
-            { class: 'muted', text: ` — ${[a.system.basin ? t(`basin.${a.system.basin}`) : null, a.system.windKt != null ? t(a.imdClassKey) : null, t('sys.awayFrom', { dist: formatDistance(a.distanceKm) })].filter(Boolean).join(', ')}` },
+            { class: 'muted', text: ` — ${[a.system.basin ? t(`basin.${a.system.basin}`) : null, a.system.windKt != null ? t(a.imdClassKey) : null, t('sys.awayFrom', { dist: formatDistance(a.distanceKm) })].filter(Boolean).join(listSep())}` },
           ),
         ),
       ),

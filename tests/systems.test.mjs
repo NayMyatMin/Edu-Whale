@@ -235,7 +235,7 @@ test('analyzeSystem: JTWC TCFA 92W — Yangon inside the formation corridor', ()
   near(a.closest.distanceKm, a.distanceKm, 1e-9);
 });
 
-test('analyzeSystem: cone and wind areas (time ≥ now − 3 h)', () => {
+test('analyzeSystem: cone and wind areas (the latest one at or before now, and later ones)', () => {
   const ring = (km) => [circlePolygon(HOME, km, 48).map(([lat, lon]) => [lon, lat])];
   const feature = (coordinates) => ({ type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates } });
   const farRing = [[[80, 5], [82, 5], [82, 7], [80, 7], [80, 5]]];
@@ -245,7 +245,7 @@ test('analyzeSystem: cone and wind areas (time ≥ now − 3 h)', () => {
     windKt: 70,
     cone: feature(ring(300)),
     windAreas: [
-      { kmh: 120, time: new Date(+NOW - 6 * H), feature: feature(ring(100)) }, // too old
+      { kmh: 120, time: new Date(+NOW - 16 * H), feature: feature(ring(100)) }, // too old
       { kmh: 60, time: new Date(+NOW + 6 * H), feature: feature(ring(200)) },
       { kmh: 90, time: new Date(+NOW + 6 * H), feature: feature(farRing) }, // elsewhere
     ],
@@ -253,9 +253,14 @@ test('analyzeSystem: cone and wind areas (time ≥ now − 3 h)', () => {
   const a = analyzeSystem(s, HOME, NOW);
   assert.equal(a.insideCone, true);
   assert.equal(a.insideWindKmh, 60);
+  assert.deepEqual(a.insideWind.map((x) => [x.kmh, x.hoursFromNow]), [[60, 6]], 'with its lead time');
 
   s.windAreas.push({ kmh: 90, time: new Date(+NOW - 2 * H), feature: feature(ring(150)) });
   assert.equal(analyzeSystem(s, HOME, NOW).insideWindKmh, 90);
+
+  // GDACS areas come 12 h apart: 6 h after one, it still describes the storm (the next is 6 h ahead).
+  s.windAreas.push({ kmh: 120, time: new Date(+NOW - 6 * H), feature: feature(ring(100)) }, { kmh: 120, time: new Date(+NOW + 6 * H), feature: feature(farRing) });
+  assert.equal(analyzeSystem(s, HOME, NOW).insideWindKmh, 120, 'area 6 h old kept: the storm is still inside its wind field');
 
   const one = analyzeSystem(gdacsOne(), HOME, new Date('2026-09-24T03:00:00Z'));
   assert.equal(one.insideCone, false);
@@ -280,7 +285,7 @@ test('analyzeSystem: GDACS system without timeline, and far-away systems', () =>
 
   const surigae = analyzeSystem(mergeSystems([gdacsSurigae()], [jtwc25W()])[0], HOME, NOW);
   assert.equal(surigae.inRegion, false);
-  assert.equal(surigae.relevant, true, '3 933 km ≤ 4 000 km');
+  assert.equal(surigae.relevant, false, '3 933 km > 2 500 km: listed under "Elsewhere", not near Myanmar');
   near(surigae.samples[1].hoursFromNow, -2.5, 1e-9, 'first hourly step after the 12Z fix');
 
   const polo = analyzeSystem(makeSystem({ position: { lat: 23.6, lon: -113.8, time: NOW } }), HOME, NOW);
@@ -304,4 +309,70 @@ test('sortAnalyses: threat level desc, then distance', () => {
   assert.deepEqual(list.map((x) => x.id), ['a', 'b', 'c', 'd', 'e'], 'input not mutated');
   assert.deepEqual(sortAnalyses(list, (x) => ({ level: x.level, reasons: [] })).map((x) => x.id), ['c', 'b', 'a', 'e', 'd']);
   assert.deepEqual(sortAnalyses(list).map((x) => x.id), ['d', 'e', 'b', 'a', 'c'], 'distance only');
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: stale fixes, merged tracks, class wind floors
+// ---------------------------------------------------------------------------
+
+const { stormThreat } = await import('../js/risk.js');
+const { parseAdvisoryText } = await import('../js/jtwc.js');
+
+test('a storm with no forecast track keeps its last position "now" (advisory summary read hours later)', () => {
+  const fix = new Date('2026-09-28T12:00:00Z');
+  const summary = makeSystem({ issuedAt: fix, position: { lat: 16.0, lon: 95.9, time: fix }, windKt: 55, track: [{ time: fix, lat: 16.0, lon: 95.9, forecast: false, windKt: 55, cls: 'TS' }] });
+  const at = (h) => {
+    const t = new Date(+fix + h * H);
+    return stormThreat(analyzeSystem(summary, HOME, t), t);
+  };
+  assert.equal(at(0.5).level, 3, 'fresh fix');
+  assert.equal(at(4).level, 3, '4 h later: still a tropical storm ~100 km away');
+  assert.ok(at(4).reasons.some((r) => r.code === 'storm.trackNear'));
+  assert.equal(at(30).level, 1, 'a day and more later the old fix no longer counts as "now"');
+});
+
+test('merge: a JTWC advisory summary does not wipe out the GDACS forecast track', () => {
+  const summary = parseAdvisoryText(jtwcFix('abpwweb.txt'), NOW).find((s) => s.designation === '25W');
+  assert.ok(summary && summary.track.length === 1);
+  const g = gdacsSurigae();
+  const gForecast = g.track.filter((p) => p.forecast && +p.time > +summary.position.time + 30 * 60e3);
+  const merged = mergeSystems([g], [summary])[0];
+  assert.equal(merged.id, 'jtwc:25W');
+  assert.deepEqual(merged.position, summary.position, 'position from the newer JTWC product');
+  assert.deepEqual(merged.issuedAt, summary.issuedAt);
+  const fc = merged.track.filter((p) => p.forecast);
+  assert.equal(fc.length, gForecast.length);
+  assert.ok(fc.length >= 5);
+  for (let i = 1; i < merged.track.length; i++) assert.ok(merged.track[i].time >= merged.track[i - 1].time, 'chronological');
+});
+
+/** Move a whole GDACS storm (geometry, timeline, event) by dlat/dlon degrees. */
+function shifted(dlat, dlon) {
+  const moveCoords = (c) => (typeof c[0] === 'number' ? [c[0] + dlon, c[1] + dlat, ...c.slice(2)] : c.map(moveCoords));
+  const geo = gdacsFix('geometry_SURIGAE-26.json');
+  for (const f of geo.features) if (f.geometry?.coordinates) f.geometry.coordinates = moveCoords(f.geometry.coordinates);
+  const tl = gdacsFix('timeline_SURIGAE-26.json');
+  const items = Array.isArray(tl.channel.item) ? tl.channel.item : [tl.channel.item];
+  for (const it of items) {
+    it.latitude = String(+it.latitude + dlat);
+    it.longitude = String(+it.longitude + dlon);
+  }
+  const ev = { ...events.find((e) => e.eventName === 'SURIGAE-26') };
+  ev.lat += dlat;
+  ev.lon += dlon;
+  return { ev, geo, tl };
+}
+
+test('GDACS storm without its wind timeline: TS/HU labels still count as that strength', () => {
+  const { ev, geo, tl } = shifted(-13.9, -41.4);
+  const at = new Date('2026-09-28T13:00:00Z');
+  const withTl = toSystem(ev, geo, tl);
+  const noTl = toSystem(ev, geo, null);
+  for (const s of [withTl, noTl]) s.windAreas = []; // only the track rules here
+  const lvlWith = stormThreat(analyzeSystem(withTl, HOME, at), at).level;
+  const lvlWithout = stormThreat(analyzeSystem(noTl, HOME, at), at).level;
+  assert.equal(noTl.windKt, null);
+  assert.ok(noTl.track.some((p) => p.windKtMin === 64), 'HU segments give a 64 kt floor');
+  assert.equal(lvlWith, 3);
+  assert.equal(lvlWithout, lvlWith, 'the missing timeline does not lower the level');
 });

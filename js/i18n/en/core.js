@@ -43,8 +43,10 @@ export default {
   'reason.dmh.news': 'DMH is reporting on a weather system: {system} (issued {time}). Keep following DMH.',
   'reason.dmh.passed': 'DMH Green stage ({system}): the storm has weakened and the danger has passed (issued {time}). Watch out for fallen trees, power lines and floodwater.',
   'reason.dmh.otherWarning': 'DMH bulletin that mentions Yangon: {title} (issued {time}).',
+  'reason.dmh.newsFinal': 'DMH has issued its last news bulletin about the {system} (issued {time}) and is no longer following it.',
 
   'reason.storm.insideWind': 'Yangon is inside the area where {name} is forecast to bring winds of {kmh} or more.',
+  'reason.storm.insideWindLater': 'Yangon is inside the area where {name} is forecast to bring winds of {kmh} or more in about {hours} hours.',
   'reason.storm.insideCone': 'Yangon is inside the forecast cone of {name}. Its path could still move towards the city.',
   'reason.storm.trackNear': '{name} ({cls}) is forecast to pass within {km} of Yangon in about {hours} hours.',
   'reason.storm.currentNear': '{name} is {km} {compass} of Yangon.',
@@ -63,6 +65,8 @@ export default {
 
   'reason.override': '{message}',
   'reason.calm': 'No storm is near Yangon, and the forecast shows no strong wind or very heavy rain.',
+  'reason.calm.partial': 'DMH has no current cyclone bulletin, and no storm is near Yangon in the sources this page could check. Some sources could not be checked (listed below).',
+  'reason.calm.noForecast': 'No storm is near Yangon. The weather forecast could not be loaded, so strong wind or heavy rain cannot be ruled out.',
   'reason.unknown': 'Some sources could not be loaded, so this page cannot say it is calm. DMH has the official picture.',
 
   // ---------------------------------------------------------------------------

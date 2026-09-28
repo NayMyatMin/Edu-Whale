@@ -41,6 +41,8 @@ test('parseRss: warnings and TCFAs with product links', () => {
     graphicUrl: `${PRODUCTS}wp2526.gif`,
     final: false,
     basinPrefix: 'wp',
+    productKey: 'wp25',
+    cancelled: false,
   });
 
   const tcfa = items[1];
@@ -276,7 +278,9 @@ test('fetchJtwc: fixtures → 92W TCFA kept, far WPAC systems dropped, EPAC not 
   assert.equal(s.potential, 'HIGH');
   assert.ok(s.tcfa, 'corridor kept');
   assert.deepEqual([s.position.lat, s.position.lon], [14.4, 98.0]);
-  assert.equal(iso(s.position.time), '2026-09-28T08:00:00.000Z', 'newest fix (advisory) used');
+  // The 28/0800Z advisory was reissued with the TCFA's old text: same point, so the 27/1200Z fix time stands.
+  assert.equal(iso(s.position.time), '2026-09-27T12:00:00.000Z', 'repeated fix keeps its real time');
+  assert.equal(s.track.filter((p) => !p.forecast).length, 1, 'no second, stationary point for the repeated fix');
   assert.equal(s.links.jtwcText, `${PRODUCTS}wp9226web.txt`);
   assert.equal(s.links.jtwcGraphic, `${PRODUCTS}wp9226.gif`);
   assert.ok(!stub.calls.some((u) => /\/ep\d{4}web\.txt/.test(u)), 'eastern Pacific texts not fetched');
@@ -294,11 +298,11 @@ test('fetchJtwc: nearer home, Surigae is kept with its forecast track', async ()
   assert.equal(s.links.jtwcText, `${PRODUCTS}wp2526web.txt`);
 });
 
-test('fetchJtwc: TCFA text missing → invest still flagged as a formation alert', async () => {
+test('fetchJtwc: TCFA text missing → invest still flagged as a formation alert, but JTWC counts as incomplete', async () => {
   const { 'wp9226web.txt': _omit, ...rest } = ALL;
   stubFetch(rest);
   const res = await fetchJtwc(NOW, HOME);
-  assert.equal(res.ok, true);
+  assert.equal(res.ok, false, 'a product the RSS lists could not be read');
   assert.equal(res.errors.length, 1);
   const s = res.systems.find((x) => x.id === 'jtwc:92W');
   assert.equal(s.kind, 'tcfa');
@@ -322,7 +326,7 @@ test('fetchJtwc: RSS down and the TCFA text missing → alert still kept from th
   const { 'jtwc.rss': _a, 'wp9226web.txt': _b, ...rest } = ALL;
   stubFetch(rest);
   const res = await fetchJtwc(NOW, HOME);
-  assert.equal(res.ok, true);
+  assert.equal(res.ok, false);
   assert.equal(res.errors.length, 2);
   assert.deepEqual(res.systems.map((s) => [s.id, s.kind, s.potential]), [['jtwc:92W', 'tcfa', 'HIGH']]);
   assert.equal(res.systems[0].tcfa, null);
@@ -405,4 +409,74 @@ test('fetchJtwc: total failure → ok:false, never throws', async () => {
   assert.equal(res.ok, false);
   assert.deepEqual(res.systems, []);
   assert.match(res.error, /Failed to fetch/);
+});
+
+// ---------------------------------------------------------------------------
+// Coverage is only "ok" when JTWC's products were really read
+// ---------------------------------------------------------------------------
+
+test('fetchJtwc: an HTML page (or empty body) served with status 200 is a failure, not an empty feed', async () => {
+  for (const body of ['<!DOCTYPE html><html><body>Temporarily unavailable</body></html>', '']) {
+    globalThis.fetch = async () => new Response(body, { status: 200 });
+    const res = await fetchJtwc(NOW, HOME);
+    assert.equal(res.ok, false, JSON.stringify(body.slice(0, 20)));
+    assert.deepEqual(res.systems, []);
+    assert.ok(res.errors.some((e) => /RSS/.test(e)));
+    assert.ok(res.errors.some((e) => /abioweb\.txt: unrecognised content/.test(e)));
+  }
+});
+
+test('fetchJtwc: RSS up but the Indian Ocean advisory down → ok:false (its invests would be missing)', async () => {
+  const { 'abioweb.txt': _omit, ...rest } = ALL;
+  stubFetch(rest);
+  const res = await fetchJtwc(NOW, HOME);
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.systems.map((s) => [s.id, s.kind]), [['jtwc:92W', 'tcfa']], 'what was read is kept');
+});
+
+test('fetchJtwc: a quiet RSS with both advisories read is ok', async () => {
+  const quietAbio = ALL['abioweb.txt'].replace(/B\. TROPICAL DISTURBANCE SUMMARY:[\s\S]*?(?=\s+C\. SUBTROPICAL|\s+2\.)/, 'B. TROPICAL DISTURBANCE SUMMARY: NONE.');
+  stubFetch({ 'jtwc.rss': '<?xml version="1.0"?><rss version="2.0"><channel><title>JTWC</title></channel></rss>', 'abioweb.txt': quietAbio, 'abpwweb.txt': ALL['abpwweb.txt'] });
+  const res = await fetchJtwc(NOW, HOME);
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.errors, []);
+});
+
+test('advisory: a reference to a cancelled formation alert does not promote the invest', () => {
+  const text = ALL['abioweb.txt'].replace('AMPN/REF A IS A TROPICAL CYCLONE FORMATION ALERT.//', 'AMPN/REF A IS A TROPICAL CYCLONE FORMATION ALERT CANCELLATION.//');
+  stubFetch({ 'jtwc.rss': '<rss><channel></channel></rss>', 'abioweb.txt': text, 'abpwweb.txt': ALL['abpwweb.txt'] });
+  return fetchJtwc(NOW, HOME).then((res) => {
+    const s = res.systems.find((x) => x.id === 'jtwc:92W');
+    assert.equal(s.kind, 'invest');
+  });
+});
+
+test('fetchJtwc: a cancelled Bay of Bengal alert whose RSS entry lacks its designation stays cancelled', async () => {
+  // Live RSS at 28/1730Z: the cancelled block links only the text and fix files (no "93B_…sair.jpg").
+  const rss = `<rss><channel><item><title>North Indian Ocean</title><description><![CDATA[
+    <p><b>Tropical Cyclone Formation Alert WTIO21 Cancelled</b><br>Issued at 28/1730Z</p>
+    <ul><li><a href="https://www.metoc.navy.mil/jtwc/products/io9326web.txt">TCFA Text</a></li>
+    <li><a href="https://www.metoc.navy.mil/jtwc/products/io9326fix.txt">Fix</a></li></ul>
+  ]]></description></item></channel></rss>`;
+  const abio = ALL['abioweb.txt'].replace(/92W/g, '93B');
+  stubFetch({ 'jtwc.rss': rss, 'abioweb.txt': abio, 'abpwweb.txt': ALL['abpwweb.txt'] }); // io9326web.txt → 403
+  const items = parseRss(rss);
+  assert.equal(items[0].designation, null);
+  assert.equal(items[0].productKey, 'io93');
+  assert.equal(items[0].cancelled, true);
+  const res = await fetchJtwc(NOW, HOME);
+  const s = res.systems.find((x) => x.id === 'jtwc:93B');
+  assert.equal(s.kind, 'invest', 'the stale advisory\'s "SEE REF A" must not bring the cancelled alert back');
+});
+
+test('fetchJtwc: with the RSS down, the alert text URL uses the year of the referring message (Dec → Jan)', async () => {
+  const jan1 = new Date('2027-01-01T03:00:00Z');
+  const abio = ALL['abioweb.txt']
+    .replace('ABIO10 PGTW 280800', 'ABIO10 PGTW 010000')
+    .replace('REF/A/MSG/JOINT TYPHOON WRNCEN PEARL HARBOR HI/271721ZSEP2026//', 'REF/A/MSG/JOINT TYPHOON WRNCEN PEARL HARBOR HI/312130ZDEC2026//')
+    .replace(/92W/g, '96B');
+  const stub = stubFetch({ 'abioweb.txt': abio, 'abpwweb.txt': ALL['abpwweb.txt'] });
+  await fetchJtwc(jan1, HOME);
+  assert.ok(stub.calls.includes(`${PRODUCTS}io9626web.txt`), stub.calls.join(' '));
+  assert.ok(!stub.calls.includes(`${PRODUCTS}io9627web.txt`));
 });

@@ -114,11 +114,11 @@ function summaries(rows, now) {
   return { wind, rain, maxGust: g, maxRain: r && r.raw.precipitation > 0 ? r : null };
 }
 
-function tableView(rows) {
+function tableView(rows, captionId) {
   return h(
     'table',
     { class: 'hc-table-el' },
-    h('caption', { text: t('chart.tableCaption') }),
+    h('caption', { id: captionId, text: t('chart.tableCaption') }),
     h(
       'thead',
       {},
@@ -167,6 +167,9 @@ function legendItem(kind, cls, label) {
 export function renderHourlyCharts(container, weather, { now = new Date(), hours = 48 } = {}) {
   if (!container) return;
   const prev = state.get(container);
+  // Keep the hour a keyboard user was reading when the charts are redrawn (e.g. by a refresh).
+  const focusedChart = document.activeElement?.classList?.contains('hc-charts') && container.contains(document.activeElement);
+  const keepTime = focusedChart && prev?.active != null ? prev.activeTime : null;
   prev?.cleanup?.();
   const rows = dataFor(weather, now, hours);
   if (rows.length < 3) {
@@ -188,11 +191,14 @@ export function renderHourlyCharts(container, weather, { now = new Date(), hours
     h('div', { class: 'hc-chart' }, h('p', { class: 'hc-title', text: t('chart.rainTitle', { unit: rainUnitLabel() }) }), rainSvg),
     tooltip,
   );
-  const tableWrap = h('div', { class: 'hc-table table-scroll', hidden: true }, tableView(rows));
+  const captionId = `${hintId}-caption`;
+  // A scrolling box needs to be focusable (and named) for keyboard users to scroll it.
+  const tableWrap = h('div', { class: 'hc-table table-scroll', role: 'region', tabindex: '0', 'aria-labelledby': captionId, hidden: true }, tableView(rows, captionId));
   const showTable = prev?.showTable === true;
+  // An action button: its label says what it does ("Show as table"), so no pressed state.
   const toggle = h(
     'button',
-    { type: 'button', class: 'btn btn-quiet btn-sm hc-toggle', 'aria-pressed': String(showTable) },
+    { type: 'button', class: 'btn btn-quiet btn-sm hc-toggle' },
     icon(showTable ? 'chart' : 'table', { size: 18 }),
     h('span', { text: t(showTable ? 'chart.showChart' : 'chart.showTable') }),
   );
@@ -222,7 +228,11 @@ export function renderHourlyCharts(container, weather, { now = new Date(), hours
   );
   fill(container, figure);
 
-  const st = { showTable, active: null, width: 0, geom: null, cleanup: null };
+  const st = { showTable, active: null, activeTime: null, width: 0, geom: null, cleanup: null };
+  if (keepTime != null) {
+    const i = rows.findIndex((r) => r.time.getTime() === keepTime);
+    if (i >= 0) st.active = i;
+  }
   state.set(container, st);
 
   toggle.addEventListener('click', () => {
@@ -413,6 +423,7 @@ export function renderHourlyCharts(container, weather, { now = new Date(), hours
   let liveTimer = 0;
   function setActive(i, { announce = true } = {}) {
     st.active = i;
+    st.activeTime = rows[i]?.time.getTime() ?? null;
     const g = st.geom;
     if (!g) return;
     const r = rows[i];

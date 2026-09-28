@@ -39,3 +39,12 @@ test('index.html only references files that exist', () => {
   const absent = refs.filter((p) => !existsSync(join(ROOT, p)));
   assert.deepEqual(absent, []);
 });
+
+test('sw.js: data files are network-only, app files network-first, install all-or-nothing', () => {
+  assert.doesNotMatch(sw, /ignoreSearch/, 'a query-less match returns the oldest cached copy');
+  assert.ok(!SHELL.some((p) => p.startsWith('data/')), 'no data file in the shell');
+  assert.match(sw, /startsWith\(`\$\{scopePath\}data\/`\)\) return;/, 'data/*.json goes straight to the network');
+  assert.match(sw, /cache\.addAll\(CRITICAL\.map\(fresh\)\)/);
+  assert.match(sw, /cache: 'no-cache'/);
+  assert.doesNotMatch(sw, /cache: 'reload'/, 'unchanged files revalidate (304) instead of downloading again');
+});

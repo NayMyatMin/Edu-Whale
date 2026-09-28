@@ -4,14 +4,16 @@ import { DMH_LINKS, DMH_STAGES } from '../config.js';
 import {
   formatDateTime,
   formatDistance,
+  formatRelative,
+  formatTemp,
   formatWhen,
   formatWind,
   getLang,
   pickLang,
+  systemName,
   t,
   tReason,
   withLang,
-  formatTemp,
 } from '../i18n.js';
 import { h, icon, levelMeta, extLink, fill } from './dom.js';
 
@@ -30,8 +32,13 @@ export function levelName(level) {
 
 export function listFormat(items, type = 'conjunction') {
   const list = items.filter(Boolean);
-  // Chrome has no Burmese list data (it would print English "and"); use the Burmese comma.
-  if (getLang() === 'my') return list.join('၊ ');
+  // Chrome has no Burmese list data (it would print English "and"): join with
+  // the Burmese comma and a spoken "and" (နဲ့) / "or" (ဒါမှမဟုတ်) before the last item.
+  if (getLang() === 'my') {
+    if (list.length < 2) return list.join('');
+    const last = list[list.length - 1];
+    return `${list.slice(0, -1).join('၊ ')} ${type === 'disjunction' ? 'ဒါမှမဟုတ်' : 'နဲ့'} ${last}`;
+  }
   try {
     return new Intl.ListFormat(getLang() === 'my' ? 'my' : 'en', { style: 'long', type }).format(list);
   } catch {
@@ -105,7 +112,9 @@ export function renderStatus(el, state, ctx = {}) {
       : null,
     h('p', { class: 'status-advice', text: t(`level.${key}.advice`) }),
     gapsLine(risk.gaps),
-    (ctx.notices ?? []).length ? h('ul', { class: 'status-notices' }, ctx.notices.map((n) => h('li', { class: `notice-${n.kind}` }, icon(n.kind === 'warn' ? 'alert' : 'clock', { size: 18 }), h('span', { text: n.text })))) : null,
+    (ctx.notices ?? []).length
+      ? h('ul', { class: 'status-notices' }, ctx.notices.map((n) => h('li', { class: `notice-${n.kind}`, dataset: { notice: n.key ?? '' } }, icon(n.kind === 'warn' ? 'alert' : 'clock', { size: 18 }), h('span', { text: n.text }))))
+      : null,
     h(
       'div',
       { class: 'status-actions' },
@@ -119,43 +128,69 @@ export function renderStatus(el, state, ctx = {}) {
     ),
     h('p', { class: 'status-smallprint', text: t('status.smallprint') }),
   );
-  // Only replace the live region when something changed, so screen readers
-  // are not read the whole card again on every quiet refresh.
-  const sig = card.textContent;
-  if (el.dataset.sig === sig && el.firstElementChild?.classList.contains('status-card')) return;
+  // Only replace the live region when something meaningful changed, so
+  // screen readers are not read the whole card again on every quiet refresh.
+  // A notice whose only change is its "… ago" time is updated in place.
+  const noticeText = (root) => [...root.querySelectorAll('.status-notices li')].map((li) => li.textContent).join('|');
+  const sig = JSON.stringify([getLang(), key, shown, rest, risk.gaps ?? [], (ctx.notices ?? []).map((n) => n.key ?? n.text), ctx.demo ? 1 : 0]);
+  const current = el.firstElementChild;
+  if (el.dataset.sig === sig && current?.classList.contains('status-card')) {
+    if (noticeText(current) !== noticeText(card)) {
+      const spans = current.querySelectorAll('.status-notices li > span');
+      (ctx.notices ?? []).forEach((n, i) => {
+        if (spans[i] && spans[i].textContent !== n.text) spans[i].textContent = n.text;
+      });
+    }
+    return;
+  }
   el.dataset.sig = sig;
   fill(el, card);
 }
 
-function gapsLine(gaps) {
+/** "DMH bulletins, GDACS and JTWC" for the sources that could not be checked, or ''. */
+function gapsText(gaps) {
   const all = gaps ?? [];
   // "storm feeds" already covers both of them.
   const shown = all.includes('storms') ? all.filter((g) => g !== 'gdacs' && g !== 'jtwc') : all;
   const list = shown.map((g) => t(`gap.${g}`)).filter((s) => s && !s.startsWith('gap.'));
-  if (!list.length) return null;
-  return h('p', { class: 'status-gaps' }, icon('info', { size: 18 }), h('span', { text: t('status.gaps', { list: listFormat(list) }) }));
+  return list.length ? listFormat(list) : '';
+}
+
+function gapsLine(gaps) {
+  const list = gapsText(gaps);
+  if (!list) return null;
+  return h('p', { class: 'status-gaps' }, icon('info', { size: 18 }), h('span', { text: t('status.gaps', { list }) }));
 }
 
 /**
- * Short plain-text summary for Viber / Messenger / SMS, in `lang`.
+ * Short plain-text summary for Viber / Messenger / SMS, in `lang`. It says
+ * how old the information is and what could not be checked, exactly as the
+ * page does: a forwarded message must never look more certain than the page.
  * @param {object} risk RiskAssessment
  * @param {object[]} analyses SystemAnalysis[] (sorted, most important first)
  * @param {object|null} dmhStatus DmhStatus
  * @param {object|null} weather WeatherData
  * @param {'en'|'my'} [lang]
- * @param {{now?: Date, demo?: boolean, url?: string}} [opts]
+ * @param {{now?: Date, demo?: boolean, url?: string, dataTime?: Date|null, dmhFetchState?: string, weatherStale?: boolean}} [opts]
  */
 export function buildShareText(risk, analyses, dmhStatus, weather, lang = getLang(), opts = {}) {
   return withLang(lang, () => {
     const now = opts.now ?? new Date();
     const lines = [];
     lines.push(t('share.header', { app: t('app.name'), time: formatDateTime(now) }));
+    if (opts.dataTime instanceof Date && now - opts.dataTime > 5 * 60e3) {
+      lines.push(t('share.dataTime', { time: formatDateTime(opts.dataTime), ago: formatRelative(opts.dataTime, now) }));
+    }
     if (opts.demo) lines.push(t('demo.banner'));
     lines.push(t('share.level', { level: levelName(risk?.level ?? null) }));
     lines.push(t(`level.${levelKey(risk?.level ?? null)}.headline`));
     for (const r of reasonTexts(risk).shown) lines.push(`• ${r}`);
+    const gaps = gapsText(risk?.gaps);
+    if (gaps) lines.push(t('status.gaps', { list: gaps }));
 
-    const b = dmhStatus?.bulletin;
+    // The bulletin that matters most among those in force (DMH may run several series).
+    const b = dmhStatus?.lead ?? dmhStatus?.bulletin;
+    const dmhUnchecked = !dmhStatus?.available || dmhStatus.checkStale || opts.dmhFetchState === 'error' || opts.dmhFetchState === 'cached';
     if (b && b.isCurrent) {
       const stage = b.stage && DMH_STAGES[b.stage] ? t(`dmh.stage.${b.stage}`) : null;
       lines.push(
@@ -167,7 +202,10 @@ export function buildShareText(risk, analyses, dmhStatus, weather, lang = getLan
       );
       const url = pickLang(b.url);
       if (url) lines.push(url);
-    } else if (dmhStatus?.available) {
+      if (dmhStatus.checkStale && dmhStatus.checkedAt) lines.push(t('share.dmhStale', { time: formatDateTime(dmhStatus.checkedAt), ago: formatRelative(dmhStatus.checkedAt, now) }));
+    } else if (dmhStatus?.available && dmhStatus.checkedAt && dmhUnchecked) {
+      lines.push(t('share.dmhStale', { time: formatDateTime(dmhStatus.checkedAt), ago: formatRelative(dmhStatus.checkedAt, now) }));
+    } else if (dmhStatus?.available && !dmhStatus.partial) {
       lines.push(t('share.dmhNone'));
     } else {
       lines.push(t('share.dmhUnknown'));
@@ -175,11 +213,11 @@ export function buildShareText(risk, analyses, dmhStatus, weather, lang = getLan
 
     const top = (analyses ?? []).find((a) => a.relevant);
     if (top && !(b && b.isCurrent)) {
-      lines.push(t('share.system', { name: top.system.name, dist: formatDistance(top.distanceKm), dir: t(`dir.${top.compassFromHome}`) }));
+      lines.push(t('share.system', { name: systemName(top.system.name), dist: formatDistance(top.distanceKm), dir: t(`dir.${top.compassFromHome}`) }));
     }
 
     const c = weather?.current;
-    if (c && (c.temperature != null || c.windSpeed != null)) {
+    if (c && !opts.weatherStale && (c.temperature != null || c.windSpeed != null)) {
       lines.push(
         t('share.weather', {
           temp: formatTemp(c.temperature),

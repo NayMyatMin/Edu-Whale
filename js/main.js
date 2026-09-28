@@ -20,10 +20,12 @@ import {
   onLangChange,
   onUnitsChange,
   setLang,
+  sentenceEnd,
   setUnits,
   t,
 } from './i18n.js';
 import { loadEntry, save } from './cache.js';
+import { withDeadline } from './net.js';
 import {
   buildShareText,
   renderAbout,
@@ -44,8 +46,20 @@ const SNAPSHOT_KEY = 'snapshot';
 const THEME_KEY = 'ysw.theme';
 const DEMO_NAMES = ['calm', 'watch', 'approach', 'today'];
 const VISIBLE_REFRESH_MS = 5 * 60e3;
+// After a refresh where nothing could be reached, coming back retries sooner.
+const VISIBLE_RETRY_MS = 60e3;
 const CLOCK_MS = 15e3;
 const RETRY_DELAY_MS = 2000;
+// Each source gets an overall deadline so one stuck feed can never hold the others.
+const SOURCE_DEADLINE_MS = { weather: 45e3, gdacs: 90e3, jtwc: 90e3, dmh: 45e3, override: 30e3 };
+// DMH (same origin) is shown this soon even while slow third-party feeds are still loading.
+const INTERIM_RENDER_MS = 3500;
+// A refresh still "running" after this is abandoned and a new one may start.
+const REFRESH_WATCHDOG_MS = 120e3;
+// Data on screen older than this (e.g. a phone waking up) is aged before the refresh finishes.
+const AGE_ON_SCREEN_MS = 30 * 60e3;
+// A device clock this far from the server's is corrected and pointed out.
+const CLOCK_SKEW_MS = 10 * 60e3;
 // A saved forecast older than this is not shown at all.
 const WEATHER_KEEP_MS = 36 * 3600e3;
 const SOURCE_MODULES = {
@@ -58,6 +72,11 @@ const SOURCE_MODULES = {
 
 const $ = (sel) => document.querySelector(sel);
 
+/** "Now" corrected for a device clock that is set wrong (see noteServerTime). */
+function appNow() {
+  return new Date(Date.now() + app.clockOffsetMs);
+}
+
 const els = {};
 const app = {
   demo: null,
@@ -67,6 +86,13 @@ const app = {
   updatedAt: null,
   fromCache: false,
   refreshing: null,
+  refreshStartedAt: 0,
+  generation: 0,
+  pendingRefresh: null,
+  lastAttemptAt: null,
+  lastFailed: false,
+  dataAt: null,
+  clockOffsetMs: 0,
   map: null,
   mapLoading: null,
   mods: null,
@@ -78,7 +104,7 @@ function emptySources() {
     weather: { data: null, ok: false, fetchedAt: null },
     gdacs: { systems: [], ok: false, fetchedAt: null },
     jtwc: { systems: [], ok: false, fetchedAt: null },
-    dmh: { json: null, state: 'error', fetchedAt: null },
+    dmh: { json: null, state: 'loading', fetchedAt: null },
     override: { json: null },
   };
 }
@@ -138,20 +164,32 @@ function boot() {
   else renderAll();
 
   refresh();
-  setInterval(() => refresh(), REFRESH_MS);
-  setInterval(() => renderFreshnessLine(), CLOCK_MS);
-  document.addEventListener('visibilitychange', () => {
+  // A hidden page does not need fresh data; coming back refreshes it (below).
+  setInterval(() => {
+    if (!document.hidden) refresh();
+  }, REFRESH_MS);
+  setInterval(() => {
+    renderFreshnessLine();
+    ageOnScreen();
+  }, CLOCK_MS);
+  const onVisible = () => {
     if (document.visibilityState !== 'visible') return;
     renderFreshnessLine();
-    if (!app.updatedAt || Date.now() - app.updatedAt.getTime() > VISIBLE_REFRESH_MS) refresh();
-  });
+    ageOnScreen();
+    const last = app.lastAttemptAt ?? app.updatedAt;
+    const wait = app.lastFailed ? VISIBLE_RETRY_MS : VISIBLE_REFRESH_MS;
+    if (!last || appNow() - last > wait) refresh();
+  };
+  document.addEventListener('visibilitychange', onVisible);
+  addEventListener('pageshow', (ev) => ev.persisted && onVisible());
   addEventListener('online', () => {
     renderFreshnessLine();
-    refresh();
+    refresh({ trigger: 'online' });
   });
   addEventListener('offline', () => renderFreshnessLine());
 
   setupLazyMap();
+  setupChipNav();
   registerServiceWorker();
 }
 
@@ -179,7 +217,7 @@ function applyLanguage() {
     if (app.demo) {
       els.demoBanner.replaceChildren(
         h('strong', { text: t('demo.banner') }),
-        h('span', { text: ` ${t(`demo.name.${app.demo}`)}. ` }),
+        h('span', { text: ` ${t(`demo.name.${app.demo}`)}${sentenceEnd()} ` }),
         h('a', { href: location.pathname, text: t('demo.exit') }),
       );
     }
@@ -191,9 +229,11 @@ function applyLanguage() {
 function updateUnitsButton() {
   if (!els.unitsBtn) return;
   const metric = getUnits() === 'metric';
-  els.unitsBtn.querySelector('.units-label').textContent = t(metric ? 'unit.kmh' : 'unit.mph');
-  els.unitsBtn.setAttribute('aria-label', t(metric ? 'header.unitsToImperial' : 'header.unitsToMetric'));
-  els.unitsBtn.title = els.unitsBtn.getAttribute('aria-label');
+  const visible = t(metric ? 'unit.kmh' : 'unit.mph');
+  els.unitsBtn.querySelector('.units-label').textContent = visible;
+  // The accessible name starts with the visible text, so speech input ("tap km/h") works.
+  els.unitsBtn.setAttribute('aria-label', `${visible} — ${t(metric ? 'header.unitsToImperial' : 'header.unitsToMetric')}`);
+  els.unitsBtn.title = t(metric ? 'header.unitsToImperial' : 'header.unitsToMetric');
 }
 
 function effectiveTheme() {
@@ -255,61 +295,159 @@ function stormFallback(prev, now) {
   return { systems: [], ok: false, stale: false, fetchedAt: prev?.fetchedAt ?? null };
 }
 
-async function fetchLive(now) {
-  const mods = await loadModules();
+/**
+ * Sources as they stand when some are older than their "fresh" window: a
+ * saved or long-idle copy never counts as a live check. Storm feeds become
+ * stale stand-ins (a gap, so they cannot make the page say Calm), dropped
+ * after 12 h; the forecast is marked stale after 3 h and dropped after 36 h.
+ */
+function ageSources(src, now, { restored = false } = {}) {
+  const out = { ...src };
+  for (const key of ['gdacs', 'jtwc']) {
+    const f = out[key];
+    if (!f) continue;
+    if (ageMs(f.fetchedAt, now) > STALE_AFTER_MS.storms) out[key] = { ...f, ok: false, stale: false, systems: [] };
+    else if (restored || f.ok) out[key] = { ...f, ok: false, stale: Boolean(Array.isArray(f.systems) && (f.ok || f.stale)) };
+  }
+  const w = out.weather;
+  if (w?.data && ageMs(w.fetchedAt, now) > WEATHER_KEEP_MS) out.weather = { data: null, ok: false, fetchedAt: null };
+  else if (w && ageMs(w.fetchedAt, now) > STALE_AFTER_MS.weather) out.weather = { ...w, ok: false, stale: true };
+  return out;
+}
+
+/** Correct a wrong device clock from the server's Date header / DMH's check time. */
+function noteServerTime(serverMs) {
+  if (!Number.isFinite(serverMs)) return;
+  const skew = serverMs - Date.now();
+  if (Math.abs(skew) > CLOCK_SKEW_MS) app.clockOffsetMs = skew;
+  else if (Math.abs(app.clockOffsetMs) > 0 && Math.abs(skew) <= CLOCK_SKEW_MS / 2) app.clockOffsetMs = 0;
+}
+
+function fetchTasks(mods, now) {
   const need = (m, fn) => (m ? fn(m) : Promise.reject(new Error('module unavailable')));
   // Mobile connections drop requests; the two single-request sources get one retry.
   const retryOnce = (fn) => fn().catch(() => new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS)).then(fn));
-  const [w, g, j, d, o] = await Promise.allSettled([
-    need(mods.weather, (m) => retryOnce(() => m.fetchWeather(HOME, now))),
-    need(mods.gdacs, (m) => m.fetchGdacs(now, HOME)),
-    need(mods.jtwc, (m) => m.fetchJtwc(now, HOME)),
-    need(mods.dmh, (m) => retryOnce(() => m.fetchDmhJson({ now: now.getTime() }))),
-    need(mods.dmh, (m) => m.fetchOverride({ now: now.getTime() })),
-  ]);
-  const prev = app.sources;
-  const next = emptySources();
+  const onResponse = (res) => noteServerTime(Date.parse(res.headers.get('date') ?? ''));
+  return {
+    weather: need(mods.weather, (m) => retryOnce(() => m.fetchWeather(HOME, now))),
+    gdacs: need(mods.gdacs, (m) => m.fetchGdacs(now, HOME)),
+    jtwc: need(mods.jtwc, (m) => m.fetchJtwc(now, HOME)),
+    dmh: need(mods.dmh, (m) => retryOnce(() => m.fetchDmhJson({ now: now.getTime(), onResponse }))),
+    override: need(mods.dmh, (m) => m.fetchOverride({ now: now.getTime() })),
+  };
+}
 
-  if (w.status === 'fulfilled' && w.value) next.weather = { data: w.value, ok: true, fetchedAt: now };
+/**
+ * Next sources from settled fetch results (`results[key]` = allSettled-style
+ * entry, or undefined while still pending: then the previous copy stands in
+ * as a gap). Returns the sources and what actually succeeded.
+ */
+function combineSources(prev, results, now, { log = true } = {}) {
+  const next = emptySources();
+  const fulfilled = (k) => results[k]?.status === 'fulfilled';
+  const w = results.weather;
+  if (fulfilled('weather') && w.value) next.weather = { data: w.value, ok: true, fetchedAt: now };
   else {
-    logFailure('weather', w.reason);
+    if (log && w) logFailure('weather', w.reason);
     next.weather = prev.weather.data && ageMs(prev.weather.fetchedAt, now) <= WEATHER_KEEP_MS ? { ...prev.weather, ok: false, stale: true } : { data: null, ok: false, fetchedAt: null };
   }
 
-  for (const [key, res] of [
-    ['gdacs', g],
-    ['jtwc', j],
-  ]) {
-    if (res.status === 'fulfilled' && res.value?.ok) next[key] = { systems: res.value.systems ?? [], ok: true, fetchedAt: now };
-    else {
-      logFailure(key, res.status === 'fulfilled' ? res.value?.error : res.reason);
-      const fallback = stormFallback(prev[key], now);
-      const partial = res.status === 'fulfilled' && Array.isArray(res.value?.systems) ? res.value.systems : [];
-      if (partial.length) {
-        // Part of the feed answered (e.g. the Indian Ocean advisory but not the
-        // RSS): never throw a nearby formation alert away. The feed still counts
-        // as failed (gap), so this can never make the page say "Calm".
-        const ids = new Set(partial.map((s) => s?.id));
-        next[key] = {
-          systems: [...partial, ...fallback.systems.filter((s) => !ids.has(s?.id))],
-          ok: false,
-          stale: true,
-          fetchedAt: fallback.stale ? fallback.fetchedAt : null,
-        };
-      } else next[key] = fallback;
+  for (const key of ['gdacs', 'jtwc']) {
+    const res = results[key];
+    const value = fulfilled(key) ? res.value : null;
+    // GDACS "partial": a nearby storm's track or wind detail could not be loaded.
+    if (value?.ok && !value.partial) {
+      next[key] = { systems: value.systems ?? [], ok: true, fetchedAt: now };
+      continue;
     }
+    if (log && res) logFailure(key, value ? value.error ?? 'incomplete' : res.reason);
+    const fallback = stormFallback(prev[key], now);
+    const partial = Array.isArray(value?.systems) ? value.systems : [];
+    if (partial.length) {
+      // Part of the feed answered (e.g. the Indian Ocean advisory but not the
+      // RSS): never throw a nearby formation alert away. The feed still counts
+      // as failed (gap), so this can never make the page say "Calm".
+      const cached = new Map(fallback.systems.map((s) => [s?.id, s]));
+      next[key] = {
+        systems: [
+          // A formation alert whose text failed this time keeps the corridor from the last good copy.
+          ...partial.map((s) => (s?.kind === 'tcfa' && !s.tcfa && cached.get(s.id)?.tcfa ? { ...s, tcfa: cached.get(s.id).tcfa } : s)),
+          ...fallback.systems.filter((s) => !partial.some((p) => p?.id === s?.id)),
+        ],
+        ok: false,
+        stale: true,
+        fetchedAt: fallback.stale ? fallback.fetchedAt : now,
+      };
+    } else next[key] = fallback;
   }
 
-  if (d.status === 'fulfilled') next.dmh = d.value ? { json: d.value, state: 'ok', fetchedAt: now } : { json: null, state: 'missing', fetchedAt: now };
+  const d = results.dmh;
+  if (fulfilled('dmh')) next.dmh = d.value ? { json: d.value, state: 'ok', fetchedAt: now } : { json: null, state: 'missing', fetchedAt: now };
   else {
-    logFailure('dmh', d.reason);
-    next.dmh = prev.dmh.json ? { ...prev.dmh, state: 'cached' } : { json: null, state: 'error', fetchedAt: null };
+    if (log && d) logFailure('dmh', d.reason);
+    if (!d && prev.dmh.state === 'loading') next.dmh = prev.dmh;
+    else next.dmh = prev.dmh.json ? { ...prev.dmh, state: 'cached' } : { json: null, state: d ? 'error' : prev.dmh.state, fetchedAt: prev.dmh.fetchedAt ?? null };
   }
+  // DMH checks the site's clock too: data/dmh.json can never have been checked in the future.
+  const checked = Date.parse(next.dmh.json?.checkedAt ?? '');
+  if (Number.isFinite(checked) && checked - Date.now() > CLOCK_SKEW_MS) app.clockOffsetMs = Math.max(app.clockOffsetMs, checked - Date.now());
 
   // An override can only raise the level: keep the last known one if the fetch fails.
-  next.override = o.status === 'fulfilled' ? { json: o.value } : prev.override;
-  app.sources = next;
+  next.override = fulfilled('override') ? { json: results.override.value } : prev.override;
+
+  const dmhOk = fulfilled('dmh');
+  const summary = {
+    anyOk: dmhOk || next.gdacs.ok || next.jtwc.ok,
+    allOk: dmhOk && next.gdacs.ok && next.jtwc.ok && next.weather.ok,
+  };
+  return { sources: next, summary };
+}
+
+async function fetchLive(now, gen) {
+  const mods = await loadModules();
+  const tasks = fetchTasks(mods, now);
+  const results = {};
+  const all = Promise.all(
+    Object.entries(tasks).map(([key, p]) =>
+      withDeadline(p, SOURCE_DEADLINE_MS[key], key).then(
+        (value) => (results[key] = { status: 'fulfilled', value }),
+        (reason) => (results[key] = { status: 'rejected', reason }),
+      ),
+    ),
+  );
+  // Show DMH (same origin, quick) without waiting for the slowest third-party feed.
+  let done = false;
+  all.then(() => (done = true));
+  await Promise.race([all, new Promise((r) => setTimeout(r, INTERIM_RENDER_MS))]);
+  if (!done && gen === app.generation) await interimRender(now, results);
+  await all;
+  if (gen !== app.generation) return null;
+  const { sources, summary } = combineSources(app.sources, results, now);
+  app.sources = sources;
   app.fromCache = false;
+  return summary;
+}
+
+/**
+ * Render what has arrived while other feeds are still loading. Feeds still
+ * pending count as gaps, and a "Calm" is never shown early: the status is
+ * only replaced when something already warrants attention.
+ */
+async function interimRender(now, results) {
+  if (!results.dmh) return;
+  try {
+    const { sources } = combineSources(app.sources, results, now, { log: false });
+    const state = await buildAppState(sources, now);
+    if (!state) return;
+    safeRender('official', els.officialBody, () => renderOfficial(els.officialBody, state.dmh ?? null, { now, fetchState: sources.dmh.state, demo: false }));
+    if (state.risk.level != null && state.risk.level >= 1 && state.risk.level >= (app.state?.risk?.level ?? -1)) {
+      app.state = state;
+      app.now = now;
+      safeRender('status', els.statusBody, () => renderStatus(els.statusBody, state, { now, notices: statusNotices(now), demo: false, onShare: share }));
+    }
+  } catch (err) {
+    console.warn('[main] interim render skipped', err);
+  }
 }
 
 function logFailure(name, reason) {
@@ -329,62 +467,103 @@ async function loadDemo(now) {
   };
 }
 
-/** Fetch (or build the demo), recompute, render, save. Concurrent calls share one run. */
+/**
+ * Fetch (or build the demo), recompute, render, save. A call while a run is
+ * going queues one follow-up (after a run that could not reach everything,
+ * or to show the Refresh button's toast); a run stuck for two minutes is
+ * abandoned so later refreshes can recover.
+ */
 function refresh({ userAsked = false } = {}) {
-  if (app.refreshing) return app.refreshing;
-  app.refreshing = (async () => {
+  if (app.refreshing) {
+    if (Date.now() - app.refreshStartedAt < REFRESH_WATCHDOG_MS) {
+      app.pendingRefresh = { userAsked: userAsked || Boolean(app.pendingRefresh?.userAsked) };
+      return app.refreshing;
+    }
+    console.warn('[main] abandoning a refresh that never finished');
+  }
+  const gen = ++app.generation;
+  app.refreshStartedAt = Date.now();
+  const run = (async () => {
     setBusy(true);
-    const now = new Date();
+    const now = appNow();
+    let summary = null;
     try {
-      if (app.demo) await loadDemo(now);
-      else await fetchLive(now);
-      app.updatedAt = now;
-      await recompute(now);
+      if (app.demo) {
+        await loadDemo(now);
+        summary = { anyOk: true, allOk: true };
+      } else summary = await fetchLive(now, gen);
+      if (gen !== app.generation) return;
+      app.lastAttemptAt = now;
+      app.lastFailed = !summary?.anyOk;
+      // "Updated just now" only when something was actually fetched.
+      if (summary?.anyOk) app.updatedAt = now;
+      await recompute(appNow());
+      if (gen !== app.generation) return;
       renderAll();
-      if (!app.demo) saveSnapshot();
-      if (userAsked) showToast(t('toast.updated'));
+      if (!app.demo && summary?.anyOk) saveSnapshot();
+      if (userAsked) showToast(t(summary?.anyOk ? 'toast.updated' : 'toast.failed'));
     } catch (err) {
       console.error('[main] refresh failed', err);
       if (userAsked) showToast(t('toast.failed'));
     } finally {
-      app.refreshing = null;
-      setBusy(false);
+      if (gen === app.generation) {
+        app.refreshing = null;
+        setBusy(false);
+        const pending = app.pendingRefresh;
+        app.pendingRefresh = null;
+        if (pending && !summary?.allOk) refresh(pending);
+        else if (pending?.userAsked) showToast(t(summary?.anyOk ? 'toast.updated' : 'toast.failed'));
+      }
     }
   })();
-  return app.refreshing;
+  app.refreshing = run;
+  return run;
 }
 
-async function recompute(now = new Date()) {
-  app.now = now;
+/** Age what is on screen when it has sat for a while (a phone waking up), before the refresh lands. */
+function ageOnScreen() {
+  if (app.demo || !app.updatedAt || app.fromCache) return;
+  const now = appNow();
+  if (now - app.updatedAt <= AGE_ON_SCREEN_MS) return;
+  app.sources = ageSources(app.sources, now);
+  app.fromCache = true;
+  recompute(now).then(() => {
+    if (app.fromCache) renderAll();
+  });
+}
+
+/** The pipeline's state for `sources` at `now` (null only if nothing could be computed). */
+async function buildAppState(sources, now) {
   const mods = await loadModules();
-  const s = app.sources;
-  let weather = s.weather.data;
+  let weather = sources.weather.data;
   if (weather && mods.weather?.rederiveWeather) weather = mods.weather.rederiveWeather(weather, now);
-  if (!mods.pipeline) {
-    app.state = partialState(mods, weather, now);
-    return;
-  }
+  if (!mods.pipeline) return partialState(mods, weather, now, sources);
   try {
-    app.state = mods.pipeline.buildState({
-      gdacs: s.gdacs,
-      jtwc: s.jtwc,
-      dmhJson: s.dmh.json,
+    return mods.pipeline.buildState({
+      gdacs: sources.gdacs,
+      jtwc: sources.jtwc,
+      dmhJson: sources.dmh.json,
       weather,
-      overrideJson: s.override.json,
-      extraGaps: s.weather.ok ? [] : ['weather'],
+      overrideJson: sources.override.json,
+      extraGaps: sources.weather.ok ? [] : ['weather'],
       now,
     });
   } catch (err) {
     console.error('[main] pipeline failed', err);
-    app.state = partialState(mods, weather, now);
+    return partialState(mods, weather, now, sources);
   }
 }
 
+async function recompute(now = appNow()) {
+  app.now = now;
+  app.state = await buildAppState(app.sources, now);
+}
+
 /** Without the pipeline: still show DMH and the forecast, and say "Unknown — check DMH". */
-function partialState(mods, weather, now) {
+function partialState(mods, weather, now, sources = app.sources) {
   let dmh = null;
   try {
-    dmh = mods.dmh ? mods.dmh.evaluateDmh(app.sources.dmh.json, HOME, now) : null;
+    dmh = mods.dmh ? mods.dmh.evaluateDmh(sources.dmh.json, HOME, now) : null;
   } catch {
     dmh = null;
   }
@@ -415,10 +594,13 @@ function slimSystems(list, level) {
 
 function saveSnapshot() {
   const s = app.sources;
-  if (save(SNAPSHOT_KEY, { app: APP_VERSION, sources: s })) return;
+  // When the data itself is from: the oldest source the page is showing.
+  const times = [s.dmh.json ? s.dmh.fetchedAt : null, s.gdacs.fetchedAt, s.jtwc.fetchedAt].filter((d) => d instanceof Date);
+  const dataAt = times.length ? new Date(Math.min(...times.map(Number))) : app.updatedAt;
+  if (save(SNAPSHOT_KEY, { app: APP_VERSION, sources: s, dataAt })) return;
   for (const level of [1, 2]) {
     const slim = { ...s, gdacs: { ...s.gdacs, systems: slimSystems(s.gdacs.systems, level) }, jtwc: { ...s.jtwc, systems: slimSystems(s.jtwc.systems, level) } };
-    if (save(SNAPSHOT_KEY, { app: APP_VERSION, sources: slim })) return;
+    if (save(SNAPSHOT_KEY, { app: APP_VERSION, sources: slim, dataAt })) return;
   }
 }
 
@@ -430,18 +612,14 @@ async function paintSnapshot() {
     renderAll();
     return;
   }
-  const now = new Date();
-  const src = { ...emptySources(), ...snap.sources };
-  // Cached sources count as they were when saved only while still fresh.
-  for (const key of ['gdacs', 'jtwc']) {
-    const f = src[key];
-    if (f && ageMs(f.fetchedAt, now) > STALE_AFTER_MS.storms) src[key] = { ...f, ok: false, stale: false, systems: [] };
-  }
-  if (src.weather?.data && ageMs(src.weather.fetchedAt, now) > WEATHER_KEEP_MS) src.weather = { data: null, ok: false, fetchedAt: null };
-  else if (src.weather && ageMs(src.weather.fetchedAt, now) > STALE_AFTER_MS.weather) src.weather = { ...src.weather, ok: false, stale: true };
+  const now = appNow();
+  // A saved copy is never a live check: storm feeds count as stale stand-ins (gaps).
+  const src = ageSources({ ...emptySources(), ...snap.sources }, now, { restored: true });
+  if (src.dmh?.state === 'ok' || src.dmh?.state === 'missing') src.dmh = { ...src.dmh, state: src.dmh.json ? 'cached' : 'loading' };
   app.sources = src;
   app.fromCache = true;
   app.updatedAt = entry.savedAt;
+  app.dataAt = snap.dataAt instanceof Date ? snap.dataAt : entry.savedAt;
   await recompute(now);
   // The live fetch may have finished first; never paint older data over it.
   if (app.fromCache) renderAll();
@@ -453,35 +631,62 @@ async function paintSnapshot() {
 
 const summaryKey = (d) => d.dataset.key || d.querySelector('summary')?.textContent?.replace(/\s*\(.*\)\s*$/, '') || '';
 
+const FOCUSABLE = 'a[href], button, summary, input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
+/** Enough to find a focused control again once its section is rebuilt. */
+function focusKey(node, root) {
+  if (node.dataset?.focusKey) return { focusKey: node.dataset.focusKey };
+  const list = [...root.querySelectorAll(FOCUSABLE)];
+  return { tag: node.tagName, cls: node.className, text: (node.textContent ?? '').trim().slice(0, 80), index: list.indexOf(node) };
+}
+
+function restoreFocus(root, key) {
+  const list = [...root.querySelectorAll(FOCUSABLE)];
+  const target = key.focusKey
+    ? list.find((n) => n.dataset?.focusKey === key.focusKey)
+    : (list.find((n) => n.tagName === key.tag && n.className === key.cls && (n.textContent ?? '').trim().slice(0, 80) === key.text) ??
+      (list[key.index]?.tagName === key.tag ? list[key.index] : null));
+  target?.focus({ preventScroll: true });
+}
+
 function safeRender(name, el, fn) {
   if (!el) return;
-  // Re-rendering must not close what the reader opened (e.g. the DMH stage explainer).
+  // Re-rendering must not close what the reader opened (e.g. the DMH stage explainer)...
   const open = new Set([...el.querySelectorAll('details[open]')].map(summaryKey));
+  // ...nor drop keyboard / screen-reader focus to the top of the page.
+  const active = document.activeElement;
+  const key = active && active !== document.body && el.contains(active) ? focusKey(active, el) : null;
   try {
     fn();
     if (open.size) for (const d of el.querySelectorAll('details')) if (open.has(summaryKey(d))) d.open = true;
+    if (key && !el.contains(document.activeElement)) restoreFocus(el, key);
   } catch (err) {
     console.error(`[main] could not render ${name}`, err);
     el.replaceChildren(h('p', { class: 'notice notice-warn' }, icon('alert', { size: 20 }), h('span', { text: t('error.section') })));
   }
 }
 
+/** Notices inside the status card; `key` identifies each one whatever its (changing) "… ago" text. */
 function statusNotices(now) {
   const s = app.sources;
   const out = [];
-  if (app.fromCache && app.updatedAt) out.push({ kind: 'info', text: t('notice.cached', { ago: formatRelative(app.updatedAt, now) }) });
-  if (!navigator.onLine) out.push({ kind: 'warn', text: t('notice.offline') });
+  const savedAt = app.dataAt ?? app.updatedAt;
+  if (app.fromCache && savedAt) out.push({ kind: 'info', key: 'cached', text: t('notice.cached', { ago: formatRelative(savedAt, now) }) });
+  if (!navigator.onLine) out.push({ kind: 'warn', key: 'offline', text: t('notice.offline') });
+  if (Math.abs(app.clockOffsetMs) > CLOCK_SKEW_MS) {
+    out.push({ kind: 'warn', key: 'clock', text: t('notice.clock', { hours: formatNumber(Math.round(Math.abs(app.clockOffsetMs) / 360e3) / 10) }) });
+  }
   if (!app.fromCache) {
     for (const key of ['gdacs', 'jtwc']) {
-      if (s[key].stale && s[key].fetchedAt) out.push({ kind: 'info', text: t(`notice.${key}Old`, { ago: formatRelative(s[key].fetchedAt, now) }) });
+      if (s[key].stale && s[key].fetchedAt) out.push({ kind: 'info', key: `${key}Old`, text: t(`notice.${key}Old`, { ago: formatRelative(s[key].fetchedAt, now) }) });
     }
-    if (s.weather.stale && s.weather.fetchedAt) out.push({ kind: 'info', text: t('notice.weatherOld', { ago: formatRelative(s.weather.fetchedAt, now) }) });
+    if (s.weather.stale && s.weather.fetchedAt) out.push({ kind: 'info', key: 'weatherOld', text: t('notice.weatherOld', { ago: formatRelative(s.weather.fetchedAt, now) }) });
   }
   return out;
 }
 
 function renderAll() {
-  const now = app.now ?? new Date();
+  const now = app.now ?? appNow();
   const st = app.state;
   const s = app.sources;
   renderFreshnessLine();
@@ -521,7 +726,7 @@ function feedNotes() {
 function renderFreshnessLine() {
   if (!els.freshness) return;
   try {
-    renderFreshness(els.freshness, { now: new Date(), updatedAt: app.updatedAt, refreshing: Boolean(app.refreshing), offline: !navigator.onLine, demo: Boolean(app.demo) });
+    renderFreshness(els.freshness, { now: appNow(), updatedAt: app.updatedAt, refreshing: Boolean(app.refreshing), offline: !navigator.onLine, failed: app.lastFailed && !app.refreshing, demo: Boolean(app.demo) });
   } catch (err) {
     console.error('[main] freshness', err);
   }
@@ -541,7 +746,14 @@ function setBusy(busy) {
 
 async function share() {
   const st = app.state;
-  const text = buildShareText(st?.risk ?? { level: null, reasons: [], gaps: [] }, st?.analyses ?? [], st?.dmh ?? null, st?.weather ?? null, getLang(), { now: new Date(), demo: Boolean(app.demo) });
+  const s = app.sources;
+  const text = buildShareText(st?.risk ?? { level: null, reasons: [], gaps: [] }, st?.analyses ?? [], st?.dmh ?? null, st?.weather ?? null, getLang(), {
+    now: appNow(),
+    demo: Boolean(app.demo),
+    dataTime: app.updatedAt,
+    dmhFetchState: s.dmh.state,
+    weatherStale: !s.weather.ok,
+  });
   if (navigator.share) {
     try {
       await navigator.share({ title: t('app.name'), text });
@@ -594,7 +806,7 @@ function mapFormatters() {
   return {
     distance: formatDistance,
     wind: (kmh) => formatWind(kmh, { alt: true }),
-    time: (d) => formatWhen(d, new Date()),
+    time: (d) => formatWhen(d, appNow()),
     dateTime: formatDateTime,
     number: (n) => formatNumber(n),
   };
@@ -613,7 +825,9 @@ function ensureMap() {
           fmt: mapFormatters(),
           controlsEl: els.mapControls,
           windyEl: els.windyPanel,
-          now: () => new Date(),
+          now: () => appNow(),
+          // No data yet: wait for it rather than download tiles for a view that is replaced at once.
+          initialViewDelayMs: app.state ? 0 : 10000,
         });
         if (app.state) app.map.setData({ analyses: app.state.analyses, dmh: app.state.dmh });
         return app.map;
@@ -649,10 +863,44 @@ function setupLazyMap() {
 async function showOnMap(id) {
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   els.mapSection?.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+  const invoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const map = await ensureMap();
   if (!map) return;
   map.invalidate();
-  map.focusSystem(id);
+  // Focus moves into the storm's popup (and back to the button when it closes).
+  if (map.focusSystem(id, { moveFocus: true, returnFocus: invoker })) return;
+  const heading = els.mapSection?.querySelector('h2');
+  if (heading) {
+    heading.tabIndex = -1;
+    heading.focus({ preventScroll: true });
+  }
+}
+
+/**
+ * The chip row scrolls sideways on phones: keep the focused chip fully in
+ * view, and fade the edge that has more chips behind it.
+ */
+function setupChipNav() {
+  const list = document.querySelector('.chipnav ul');
+  if (!list) return;
+  const edges = () => {
+    const more = list.scrollWidth - list.clientWidth;
+    list.classList.toggle('more-right', more > 2 && list.scrollLeft < more - 2);
+    list.classList.toggle('more-left', more > 2 && list.scrollLeft > 2);
+  };
+  list.addEventListener('focusin', (ev) => {
+    const a = ev.target instanceof Element ? ev.target.closest('a') : null;
+    if (!a) return;
+    const lr = list.getBoundingClientRect();
+    const ar = a.getBoundingClientRect();
+    const pad = 24;
+    if (ar.left < lr.left + pad) list.scrollLeft -= lr.left + pad - ar.left;
+    else if (ar.right > lr.right - pad) list.scrollLeft += ar.right - (lr.right - pad);
+    edges();
+  });
+  list.addEventListener('scroll', edges, { passive: true });
+  addEventListener('resize', edges, { passive: true });
+  edges();
 }
 
 // ---------------------------------------------------------------------------

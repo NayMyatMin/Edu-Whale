@@ -14,6 +14,7 @@ import {
   parseGibsDomains,
   parseIsoDurationMs,
   pickSatelliteFrames,
+  olderSatelliteTime,
   pointClassKey,
   radarTileInfo,
   signedArea,
@@ -85,16 +86,27 @@ test('parseGibsDomains tolerates single times, junk and missing domains', () => 
   assert.equal(parseGibsDomains('<Domain>2020-01-01T00:00:00Z/2026-01-01T00:00:00Z/PT1M</Domain>').length <= 5000, true);
 });
 
-test('pickSatelliteFrames drops frames younger than the safety lag and keeps 30-min spacing', () => {
+test('pickSatelliteFrames drops frames younger than the safety lag; older frames sit on fixed :00/:30 buckets', () => {
   const now = new Date('2026-09-28T15:41:00Z');
   const frames = pickSatelliteFrames(parseGibsDomains(DOMAINS_XML), now);
   assert.equal(frames.length, SATELLITE.frames);
-  // now − 45 min = 14:56 -> 15:00 and 15:10 are dropped; newest kept is 14:50.
-  assert.equal(iso(frames.at(-1)), '2026-09-28T14:50:00.000Z');
-  // 14:20, 13:50, … every 30 minutes, oldest last in the walk back.
-  assert.equal(iso(frames.at(-2)), '2026-09-28T14:20:00.000Z');
-  assert.equal(iso(frames[0]), '2026-09-28T09:20:00.000Z');
+  // now − 55 min = 14:46 -> 14:50 and later are dropped; 14:40 is not listed (Himawari gap): newest is 14:30.
+  assert.equal(iso(frames.at(-1)), '2026-09-28T14:30:00.000Z');
+  // Then 14:00, 13:30, … on the half hours.
+  assert.equal(iso(frames.at(-2)), '2026-09-28T14:00:00.000Z');
+  assert.equal(iso(frames[0]), '2026-09-28T09:00:00.000Z');
   for (let i = 1; i < frames.length; i++) assert.equal(frames[i] - frames[i - 1], 30 * 60e3);
+  // Ten minutes later only the newest frame changes, so the loaded images are reused.
+  const later = pickSatelliteFrames(parseGibsDomains(DOMAINS_XML), new Date('2026-09-28T15:51:00Z'));
+  const shared = later.filter((f) => frames.some((g) => +g === +f)).length;
+  assert.ok(shared >= SATELLITE.frames - 1, `shared ${shared}`);
+});
+
+test('olderSatelliteTime steps back through listed times, skipping Himawari gaps', () => {
+  const times = ['14:10', '14:20', '14:30', '14:40', '14:50'].map((h) => new Date(`2026-09-28T${h}:00Z`));
+  assert.equal(iso(olderSatelliteTime(times, new Date('2026-09-28T14:50:00Z'))), '2026-09-28T14:30:00.000Z', '14:40 is a daily gap');
+  assert.equal(olderSatelliteTime(times, new Date('2026-09-28T14:50:00Z'), { notBefore: Date.parse('2026-09-28T14:45:00Z') }), null);
+  assert.equal(olderSatelliteTime([], new Date()), null);
 });
 
 test('pickSatelliteFrames bridges a gap by taking the latest time in each bucket', () => {
@@ -172,7 +184,7 @@ test('signedArea / unionRings give every outer ring the same orientation', () =>
   assert.ok(rings.every((r) => signedArea(r) > 0));
 });
 
-test('activeWindAreas keeps areas valid from now − 3 h on, grouped by strength', () => {
+test('activeWindAreas keeps the latest area at or before now plus later ones, grouped by strength', () => {
   const now = new Date('2026-09-28T12:00:00Z');
   const f = { type: 'Feature', geometry: { type: 'Polygon', coordinates: [[[90, 10], [91, 10], [91, 11], [90, 10]]] } };
   const areas = [

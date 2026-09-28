@@ -145,7 +145,12 @@ test('storm prepare: any warned system within trackKmAny / trackHoursAny; not fo
 });
 
 test('storm prepare: current centre within currentKm (warning or TCFA)', () => {
-  const cur = (km, kind) => stormThreat(analysis({ kind, km, samples: [sample(0, km, 25, false)] }), NOW);
+  const cur = (km, kind) => {
+    const a = analysis({ kind, km, samples: [sample(0, km, 25, false)] });
+    // A formation alert whose corridor is known and far from Yangon.
+    if (kind === 'tcfa') a.system.tcfa = { from: { lat: 10, lon: 90 }, to: { lat: 12, lon: 88 }, halfWidthKm: 150, validUntil: null };
+    return stormThreat(a, NOW);
+  };
   for (const kind of ['warning', 'tcfa']) {
     const r = cur(S.prepare.currentKm, kind);
     assert.equal(r.level, 2, kind);
@@ -209,11 +214,13 @@ test('storm: samples older than 1 h are ignored; final warnings still count by p
 // DMH
 // ---------------------------------------------------------------------------
 
-test('dmhThreat: stage floors near / far from THRESHOLDS.dmh.stageFloor', () => {
-  for (const [stage, [nearLevel, farLevel]] of Object.entries(D.stageFloor)) {
+test('dmhThreat: stage floors by distance band from THRESHOLDS.dmh.stageFloor', () => {
+  for (const [stage, [nearLevel, midLevel, farLevel]] of Object.entries(D.stageFloor)) {
     const near = dmhThreat(dmhStatus({ stage, near: true }));
+    const mid = dmhThreat(dmhStatus({ stage, near: true, km: 400 }));
     const far = dmhThreat(dmhStatus({ stage, near: false, km: 900 }));
     assert.equal(near.level, nearLevel, `${stage} near`);
+    assert.equal(mid.level, midLevel, `${stage} within nearKm`);
     assert.equal(far.level, farLevel, `${stage} far`);
     const code = stage === 'green' ? 'dmh.passed' : 'dmh.stage';
     assert.equal(near.reasons[0].code, code);
@@ -302,9 +309,16 @@ test('assessRisk: unknown rule and gaps', () => {
   assert.equal(dmhOk.level, 0, 'fresh DMH check covers missing storm feeds');
   assert.deepEqual(dmhOk.gaps, ['storms', 'gdacs', 'jtwc']);
 
+  // DMH is what caught 28 Sep's system first: without it, never Calm or Monitor.
   const stormsOk = assessRisk({ systems: [], dmh: null, weather: CALM_WEATHER, now: NOW });
-  assert.equal(stormsOk.level, 0, 'GDACS + JTWC both fine');
+  assert.equal(stormsOk.level, null, 'GDACS + JTWC both fine, DMH missing');
+  assert.deepEqual(codes(stormsOk), ['unknown']);
   assert.deepEqual(stormsOk.gaps, ['dmh']);
+  const investOnly = assessRisk({ systems: [analysis({ kind: 'invest', km: 300, potential: 'HIGH' })], dmh: null, weather: CALM_WEATHER, now: NOW });
+  assert.equal(investOnly.level, null, 'a Monitor-level invest with DMH missing');
+  assert.deepEqual(codes(investOnly), ['unknown', 'storm.invest']);
+  const tcfaPrepare = assessRisk({ systems: [analysis({ kind: 'tcfa', km: 250 })], dmh: null, weather: null, now: NOW });
+  assert.equal(tcfaPrepare.level, 2, 'Prepare from another source is still shown');
 });
 
 test('regression: GDACS-only data on 28 Sep never says Calm when DMH and JTWC are unavailable', () => {
@@ -417,4 +431,93 @@ test('js/i18n/en/core.js has a template for every reason, with matching placehol
     assert.ok(en[k], k);
   }
   assert.ok(Object.values(en).every((v) => typeof v === 'string' && v.trim() === v && v.length > 0));
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes
+// ---------------------------------------------------------------------------
+
+test('storm: forecast wind areas count by lead time (Danger ≤ 48 h, Prepare ≤ 72 h, later Monitor)', () => {
+  const at = (areas) => stormThreat({ ...analysis({ km: 1700 }), insideWind: areas }, NOW);
+  assert.equal(at([{ kmh: 90, hoursFromNow: -1 }]).level, 3, 'already inside');
+  assert.deepEqual(at([{ kmh: 90, hoursFromNow: 2 }]).reasons[0].params, { name: 'Test', kmh: 90 });
+  const d24 = at([{ kmh: 90, hoursFromNow: 24 }]);
+  assert.equal(d24.level, 3);
+  assert.equal(d24.reasons[0].code, 'storm.insideWindLater');
+  assert.equal(d24.reasons[0].params.hours, 24);
+  assert.equal(at([{ kmh: 90, hoursFromNow: 72 }]).level, 2, 'three days out: Prepare, not "storm weather now"');
+  assert.equal(at([{ kmh: 60, hoursFromNow: 96 }]).level, 1);
+  assert.equal(at([{ kmh: 120, hoursFromNow: 49 }, { kmh: 60, hoursFromNow: 12 }]).level, 2);
+});
+
+test('storm: a formation alert whose corridor could not be read counts within 600 km', () => {
+  const a = analysis({ kind: 'tcfa', km: 335, name: 'Invest 92W' });
+  a.system.tcfa = null;
+  const r = stormThreat(a, NOW);
+  assert.equal(r.level, 2);
+  assert.equal(r.reasons[0].code, 'storm.tcfaNear');
+  assert.equal(stormThreat(analysis({ kind: 'tcfa', km: 700 }), NOW).level, 1);
+});
+
+test('storm: old products — final warnings, stale fixes and lapsed alerts', () => {
+  const HOUR = 3600e3;
+  const finalWarning = (issuedAgoH) => {
+    const a = analysis({ km: 121, samples: [sample(0, 121, 25, false)] });
+    Object.assign(a.system, { final: true, issuedAt: new Date(NOW - issuedAgoH * HOUR), position: { lat: 16.2, lon: 95.3, time: new Date(NOW - (issuedAgoH + 4) * HOUR) } });
+    return stormThreat(a, NOW);
+  };
+  assert.equal(finalWarning(2).level, 2, 'a fresh final warning still counts by position');
+  const old = finalWarning(18);
+  assert.equal(old.level, 1, '18 h after the final warning: Monitor at most');
+  assert.ok(!old.reasons.some((r) => r.code === 'storm.currentNear'));
+
+  const stale = analysis({ km: 150, samples: [] });
+  Object.assign(stale.system, { issuedAt: new Date(NOW - 30 * HOUR), position: { lat: 16, lon: 95, time: new Date(NOW - 30 * HOUR) } });
+  assert.equal(stormThreat(stale, NOW).level, 1, 'a fix nobody re-stated for 30 h is not "150 km away now"');
+
+  const lapsed = analysis({ kind: 'tcfa', km: 250, name: 'Invest 93B', potential: 'HIGH' });
+  lapsed.system.tcfa = { from: { lat: 14, lon: 95 }, to: { lat: 16, lon: 96 }, halfWidthKm: 200, validUntil: new Date(NOW - 8 * HOUR) };
+  const r = stormThreat({ ...lapsed, tcfa: { distanceToLineKm: 30, insideCorridor: true } }, NOW);
+  assert.ok(!r.reasons.some((x) => x.code === 'storm.tcfaNear'), 'an alert 8 h past its validity is only an invest');
+  assert.equal(r.level, 1);
+});
+
+test('storm: a class-derived wind floor (GDACS without its timeline) still triggers the strength rules', () => {
+  const s = (floor) => ({ ...sample(12, 100, null), minWindKt: floor });
+  assert.equal(stormThreat(analysis({ km: 900, samples: [sample(0, 900, null, false), s(34)] }), NOW).level, 3, 'TS label: ≥ 34 kt');
+  assert.equal(stormThreat(analysis({ km: 900, samples: [sample(0, 900, null, false), { ...sample(12, 250, null), minWindKt: 64 }] }), NOW).level, 3, 'HU label within 300 km');
+  assert.equal(stormThreat(analysis({ km: 900, samples: [sample(0, 900, null, false), s(null)] }), NOW).level, 2, 'no class: any-wind rule only');
+});
+
+test('dmhThreat: DMH distance bands — Danger only near Yangon, and closer for depressions', () => {
+  const band = (km, system = 'depression', extra = {}) => dmhThreat({ ...dmhStatus({ stage: 'brown', near: km <= D.nearKm, km, system }), bulletin: { ...dmhStatus({ stage: 'brown', near: km <= D.nearKm, km, system }).bulletin, ...extra } }).level;
+  assert.equal(band(89, 'deep-depression'), 3, "28 Sep's deep depression, 89 km");
+  assert.equal(band(189), 3, 'Gwa');
+  assert.equal(band(262), 2, 'Thandwe, a depression');
+  assert.equal(band(262, 'cs'), 3, 'Thandwe, a cyclonic storm');
+  assert.equal(band(399), 2, 'Kyaukpyu');
+  assert.equal(band(556), 2, 'Myeik: still Prepare for a Brown stage');
+  assert.equal(band(900, 'cs', { mentionsYangon: true }), 3, 'DMH names Yangon');
+});
+
+test('dmhThreat: a stage-less "Warning" with no number or position is only a News (nil notices)', () => {
+  const nil = dmhThreat(dmhStatus({ kind: 'warning', stage: null, km: null, near: false, system: null }));
+  assert.equal(nil.level, D.newsFloor);
+  assert.equal(nil.reasons[0].code, 'dmh.news');
+});
+
+test('assessRisk: an incomplete or date-suspect DMH check is a gap (never Calm)', () => {
+  for (const flag of ['partial', 'dateSuspect']) {
+    const r = assessRisk({ systems: [], dmh: { ...dmhStatus(), bulletin: null, [flag]: true }, weather: CALM_WEATHER, now: NOW });
+    assert.equal(r.level, null, flag);
+    assert.deepEqual(r.gaps, ['dmh']);
+  }
+});
+
+test('assessRisk: the Calm reason never claims a source it could not check', () => {
+  const base = { systems: [], dmh: { ...dmhStatus(), bulletin: null }, now: NOW };
+  assert.deepEqual(codes(assessRisk({ ...base, weather: CALM_WEATHER })), ['calm']);
+  assert.deepEqual(codes(assessRisk({ ...base, weather: null })), ['calm.noForecast']);
+  assert.deepEqual(codes(assessRisk({ ...base, weather: CALM_WEATHER, gaps: ['jtwc'] })), ['calm.partial']);
+  assert.deepEqual(codes(assessRisk({ ...base, systems: null, weather: null })), ['calm.partial']);
 });

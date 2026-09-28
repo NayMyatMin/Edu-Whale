@@ -1,7 +1,7 @@
 // Merging GDACS + JTWC systems into one list, and measuring each system
 // against home (Yangon). Pure functions: no fetching, no DOM.
 
-import { HOME, IMD_CLASSES, JTWC_CLASSES, KT_TO_KMH, REGION_BBOX } from './config.js';
+import { HOME, IMD_CLASSES, JTWC_CLASSES, KT_TO_KMH, REGION_BBOX, THRESHOLDS } from './config.js';
 import {
   bearingDeg,
   closestPointOnSegment,
@@ -14,22 +14,32 @@ import {
 
 const HOUR_MS = 3600e3;
 
-/** Systems closer than this (or inside REGION_BBOX) are listed under "Tropical systems". */
-export const RELEVANT_KM = 4000;
+/** Systems closer than this (or inside REGION_BBOX) are listed under "Storms near Myanmar"; the rest under "Elsewhere". */
+export const RELEVANT_KM = 2500;
 
 // Matching rules for the same storm reported by GDACS and JTWC.
 const MATCH_KM = 300;
 const MATCH_HOURS = 12;
 // A shared name alone is not enough across basins/years (e.g. "One").
 const NAME_MATCH_MAX_KM = 2000;
-// Wind areas older than this are no longer "current".
-const WIND_AREA_MAX_AGE_MS = 3 * HOUR_MS;
+// GDACS wind areas come in 12-hour steps: the latest one at or before "now"
+// still describes the storm until the next one (a little slack for late episodes).
+const WIND_AREA_MAX_AGE_MS = 15 * HOUR_MS;
+// A fix older than this no longer stands for "where the storm is now".
+const MAX_FIX_AGE_MS = THRESHOLDS.storm.maxFixAgeHours * HOUR_MS;
 // Guards against bad timestamps producing huge sample arrays.
 const MAX_STEPS_PER_SEGMENT = 400;
 // Slower than this counts as stationary (no meaningful direction).
 const MIN_MOVING_KMH = 1;
 
 const KIND_RANK = { warning: 3, tcfa: 2, invest: 1 };
+// Lowest sustained wind of a TD/TS/HU label (a known class with no wind value is at least this strong).
+const CLASS_MIN_KT = Object.fromEntries(JTWC_CLASSES.filter((c) => c.minKt > 0).map((c) => [c.key, c.minKt]));
+
+/** Wind floor (kt) implied by a GDACS/JTWC class label, or null (TD or unknown). */
+export function classMinWindKt(cls) {
+  return CLASS_MIN_KT[cls] ?? null;
+}
 // Rough IMD equivalent of a GDACS line label when no wind value is known.
 const CLS_TO_IMD = { TD: 'imd.d', TS: 'imd.cs', HU: 'imd.vscs' };
 
@@ -160,10 +170,11 @@ function mergePair(g, j) {
     issuedAt: newer.issuedAt ?? older.issuedAt ?? null,
     position: newer.position,
     windKt: newer.windKt ?? older.windKt ?? null,
+    windKtMin: newer.windKtMin ?? older.windKtMin ?? null,
     gustKt: newer.gustKt ?? older.gustKt ?? null,
     movement: newer.movement ?? older.movement ?? null,
     potential: j.potential ?? g.potential ?? null,
-    track: combineTracks(newer.track, older.track),
+    track: combineTracks(newer.track, older.track, newer.position?.time),
     cone: g.cone ?? null,
     windAreas: g.windAreas ?? [],
     swath: g.swath ?? { kmh60: null, kmh90: null, kmh120: null },
@@ -177,14 +188,23 @@ function mergePair(g, j) {
 /**
  * Newest track wins; older observed history before it is kept so the map
  * still shows where the storm came from (JTWC warnings carry no history).
+ * When the newer source has no forecast at all (an advisory summary, a
+ * formation alert), the older source's forecast beyond it is kept: losing
+ * it would switch off every track rule.
  */
-function combineTracks(newerTrack, olderTrack) {
+function combineTracks(newerTrack, olderTrack, newerPositionTime = null) {
+  const margin = 30 * 60e3;
   const newer = (newerTrack ?? []).slice().sort(byTime);
   const older = olderTrack ?? [];
   if (!newer.length) return older.slice().sort(byTime);
   const first = +newer[0].time;
-  const history = older.filter((p) => !p.forecast && +p.time < first - 30 * 60e3);
-  return [...history, ...newer].sort(byTime);
+  const history = older.filter((p) => !p.forecast && +p.time < first - margin);
+  const out = [...history, ...newer];
+  if (!newer.some((p) => p.forecast)) {
+    const latest = Math.max(+newer[newer.length - 1].time, timeOf(newerPositionTime) ?? -Infinity);
+    out.push(...older.filter((p) => p.forecast && timeOf(p.time) !== null && +p.time > latest + margin));
+  }
+  return out.sort(byTime);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,12 +234,11 @@ export function analyzeSystem(system, home = HOME, now = new Date()) {
 
   const insideCone = Boolean(system.cone?.geometry && pointInGeometry(home, system.cone.geometry));
 
-  let insideWindKmh = 0;
-  for (const area of system.windAreas ?? []) {
-    const t = timeOf(area.time);
-    if (t === null || t < nowMs - WIND_AREA_MAX_AGE_MS) continue;
-    if (area.kmh > insideWindKmh && pointInGeometry(home, area.feature?.geometry)) insideWindKmh = area.kmh;
-  }
+  // Wind areas containing home, with their lead time (risk.js weighs them like the track rules).
+  const insideWind = currentWindAreas(system.windAreas, now)
+    .filter((area) => pointInGeometry(home, area.feature?.geometry))
+    .map((area) => ({ kmh: area.kmh, time: new Date(area.time), hoursFromNow: area.hoursFromNow }));
+  const insideWindKmh = insideWind.reduce((m, a) => Math.max(m, a.kmh), 0);
 
   let tcfa = null;
   if (system.tcfa?.from && system.tcfa?.to) {
@@ -240,14 +259,55 @@ export function analyzeSystem(system, home = HOME, now = new Date()) {
     inRegion,
     insideCone,
     insideWindKmh,
+    insideWind,
     tcfa,
     relevant: inRegion || distanceKm <= RELEVANT_KM,
   };
 }
 
 /**
+ * GDACS wind areas that describe the storm now or later: per strength, the
+ * latest area at or before `now` (areas come 12 hours apart, so the storm's
+ * current wind field is the last one issued, up to 15 h old) and every later
+ * one. Each gets `hoursFromNow`. Shared with the map, so it draws exactly
+ * the areas the status reasons talk about.
+ */
+export function currentWindAreas(windAreas, now = new Date(), maxAgeMs = WIND_AREA_MAX_AGE_MS) {
+  const nowMs = +now;
+  const byKmh = new Map();
+  for (const a of Array.isArray(windAreas) ? windAreas : []) {
+    const t = timeOf(a?.time instanceof Date ? a.time : a?.time ? new Date(a.time) : null);
+    if (!a || t === null || !Number.isFinite(a.kmh) || !a.feature?.geometry) continue;
+    if (!byKmh.has(a.kmh)) byKmh.set(a.kmh, []);
+    byKmh.get(a.kmh).push({ ...a, t });
+  }
+  const out = [];
+  for (const list of byKmh.values()) {
+    list.sort((x, y) => x.t - y.t);
+    const past = list.filter((x) => x.t <= nowMs);
+    const latestPast = past.length ? past[past.length - 1] : null;
+    for (const x of list) {
+      if (x.t > nowMs || (x === latestPast && nowMs - x.t <= maxAgeMs)) {
+        const { t, ...area } = x;
+        out.push({ ...area, hoursFromNow: (t - nowMs) / HOUR_MS });
+      }
+    }
+  }
+  return out.sort((x, y) => x.hoursFromNow - y.hoursFromNow || x.kmh - y.kmh);
+}
+
+/** Lowest of two class wind floors (never overstate between two points), or null. */
+function minFloor(a, b) {
+  return Number.isFinite(a) && Number.isFinite(b) ? Math.min(a, b) : null;
+}
+
+/**
  * Current position, then the future track densified to ≤ 1 h steps with
  * position and wind interpolated linearly (wind null if either end is null).
+ * `minWindKt` carries the wind floor of a known TD/TS/HU class when the wind
+ * itself is unknown (e.g. GDACS without its timeline). When no sample reaches
+ * "now" (no forecast track, e.g. an advisory summary) the last known
+ * position is repeated at "now" while the fix is under a day old.
  */
 function buildSamples(system, home, nowMs) {
   const pos = system.position;
@@ -257,23 +317,25 @@ function buildSamples(system, home, nowMs) {
     lat: pos.lat,
     lon: pos.lon,
     windKt: Number.isFinite(system.windKt) ? system.windKt : null,
+    minWindKt: Number.isFinite(system.windKtMin) ? system.windKtMin : null,
     forecast: false,
   };
   const future = (system.track ?? [])
     .filter((p) => timeOf(p.time) !== null && +p.time > startMs && Number.isFinite(p.lat) && Number.isFinite(p.lon))
     .sort(byTime);
 
-  const mk = (time, p, windKt, forecast) => ({
+  const mk = (time, p, windKt, forecast, minWindKt = null) => ({
     time,
     hoursFromNow: (time - nowMs) / HOUR_MS,
     distanceKm: haversineKm(home, p),
     windKt,
+    minWindKt,
     forecast,
     lat: p.lat,
     lon: p.lon,
   });
 
-  const out = [mk(anchor.time, anchor, anchor.windKt, false)];
+  const out = [mk(anchor.time, anchor, anchor.windKt, false, anchor.minWindKt)];
   let a = anchor;
   for (const b of future) {
     const spanMs = b.time - a.time;
@@ -281,13 +343,19 @@ function buildSamples(system, home, nowMs) {
     const n = Math.min(MAX_STEPS_PER_SEGMENT, Math.max(1, Math.ceil(spanMs / HOUR_MS - 1e-9)));
     const aWind = Number.isFinite(a.windKt) ? a.windKt : null;
     const bWind = Number.isFinite(b.windKt) ? b.windKt : null;
+    const bFloor = Number.isFinite(b.windKtMin) ? b.windKtMin : null;
+    const between = minFloor(Number.isFinite(a.minWindKt ?? a.windKtMin) ? (a.minWindKt ?? a.windKtMin) : null, bFloor);
     for (let k = 1; k <= n; k++) {
       const t = k / n;
       const last = k === n;
       const windKt = last ? bWind : aWind !== null && bWind !== null ? round1(aWind + (bWind - aWind) * t) : null;
-      out.push(mk(new Date(+a.time + spanMs * t), interpolate(a, b, t), windKt, last ? Boolean(b.forecast) : Boolean(a.forecast || b.forecast)));
+      out.push(mk(new Date(+a.time + spanMs * t), interpolate(a, b, t), windKt, last ? Boolean(b.forecast) : Boolean(a.forecast || b.forecast), last ? bFloor : between));
     }
     a = b;
+  }
+  if (!out.some((x) => x.hoursFromNow >= -1) && nowMs - startMs <= MAX_FIX_AGE_MS) {
+    const last = out[out.length - 1];
+    out.push(mk(new Date(nowMs), last, last.windKt, false, last.minWindKt));
   }
   return out;
 }

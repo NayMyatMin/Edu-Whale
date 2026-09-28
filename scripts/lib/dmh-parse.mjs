@@ -6,13 +6,19 @@
 // - Drupal 9. Node URLs look like /<lang>/<type>/<id>, type one of warning,
 //   news, top-announcement, bulletin, forecast. /index.php/ may prefix them.
 // - Cyclone bulletins titled "Warning" live under /warning/ (Myanmar is
-//   threatened); "News" and "... Condition" under /news/ (it is not).
+//   threatened); "News" under /news/ (it is not). "... Condition" posts
+//   appear under both, and DMH also files "Nothing Special" nil notices
+//   titled "Cyclone Warning" / "Cyclone News": the title and body decide the
+//   kind, not the URL.
 // - The EN RSS feed repeats shared nodes with their Burmese <title> but the
 //   English body, and links them under /my/; the English title is the first
 //   `field-name-title` span inside the description.
 // - Warnings/news carry the official issue time in a
 //   `field-name-field-{warning,news,bulletin}-post-date` <time datetime> (UTC).
 //   Node ids follow upload order, not issue order.
+
+import { HOME } from '../../js/config.js';
+import { rankDmhBulletins } from '../../js/dmh.js';
 
 export const DMH_ORIGIN = 'https://www.moezala.gov.mm';
 export const GENERATOR = 'scripts/fetch-dmh.mjs';
@@ -185,21 +191,29 @@ const CYCLONE_TITLE_EN = /\b(?:low[\s-]+pressure|depression|cyclon\w*|storm|typh
 const CYCLONE_TITLE_MY = /လေဖိအားနည်း|မုန်တိုင်း|ဆိုင်ကလုန်း/;
 const NOT_CYCLONE_MY = /မိုးသက်မုန်တိုင်း|မိုးကြိုးမုန်တိုင်း/; // thunderstorm
 
+/** Clean text with run-together words split: DMH sometimes titles "WellMarkedLowPressureAreaCondition". */
+export function titleWords(s) {
+  return cleanText(s).replace(/([a-z])([A-Z])/g, '$1 $2');
+}
+
 /** True for titles about lows, depressions and cyclones (either language). */
 export function isCycloneTitle(title) {
-  const t = cleanText(title);
+  const t = titleWords(title);
   if (!t) return false;
   if (CYCLONE_TITLE_EN.test(t)) return true;
   return CYCLONE_TITLE_MY.test(t) && !NOT_CYCLONE_MY.test(t);
 }
 
-// Most specific first: several names contain shorter ones.
+// Most specific first: several names contain shorter ones. Western Pacific
+// names map to the nearest IMD class (typhoon ≈ very severe cyclonic storm).
+// A bare "Cyclone Warning" / "Cyclone News" (DMH's generic, often nil,
+// notice) names no system.
 const SYSTEM_RULES = [
-  ['sucs', /super\s+cyclonic/i, /စူပါ\s*ဆိုင်ကလုန်း/],
+  ['sucs', /super\s+cyclonic|super\s+typhoon/i, /စူပါ\s*ဆိုင်ကလုန်း/],
   ['escs', /extremely\s+severe/i, /အလွန့်\s*အလွန်\s*အားကောင်းသော\s*ဆိုင်ကလုန်း/],
-  ['vscs', /very\s+severe/i, /(?:အားအလွန်ကောင်းသော|အလွန်အားကောင်းသော)\s*ဆိုင်ကလုန်း/],
-  ['scs', /severe\s+cyclonic/i, /အားကောင်းသော\s*ဆိုင်ကလုန်း/],
-  ['cs', /cyclonic\s+storm|\bcyclone\b/i, /ဆိုင်ကလုန်း/],
+  ['vscs', /very\s+severe|\btyphoon\b/i, /(?:အားအလွန်ကောင်းသော|အလွန်အားကောင်းသော)\s*ဆိုင်ကလုန်း|တိုင်ဖွန်း/],
+  ['scs', /severe\s+cyclonic|severe\s+tropical\s+storm/i, /အားကောင်းသော\s*ဆိုင်ကလုန်း/],
+  ['cs', /cyclonic\s+storm|\btropical\s+storm\b|\bcyclone\b(?!\s+(?:warning|news)\b)/i, /ဆိုင်ကလုန်း/],
   ['deep-depression', /deep\s+depression/i, /အားကောင်းသော\s*မုန်တိုင်းငယ်/],
   ['depression', /depression/i, /မုန်တိုင်းငယ်/],
   ['well-marked-low', /well[\s-]*marked\s+low/i, /အားကောင်းသော\s*လေဖိအားနည်း/],
@@ -208,10 +222,40 @@ const SYSTEM_RULES = [
 
 /** DMH system key from a bulletin title (EN or MY), or null. */
 export function systemFromTitle(title) {
-  const t = cleanText(title);
+  const t = titleWords(title);
   if (!t) return null;
   for (const [key, en, my] of SYSTEM_RULES) if (en.test(t) || my.test(t)) return key;
   return null;
+}
+
+/**
+ * 'warning' | 'news' from a bulletin's titles (DMH files "… Condition" posts
+ * and nil notices under either path), else the URL's type.
+ */
+export function kindFromTitles(titleEn, titleMy, pathKind = null) {
+  const en = titleWords(titleEn);
+  if (/\bwarning\b/i.test(en)) return 'warning';
+  if (/\b(?:news|condition)\b/i.test(en)) return 'news';
+  const my = cleanText(titleMy);
+  if (/သတိပေးချက်/.test(my)) return 'warning';
+  if (/အခြေအနေ|သတင်း/.test(my)) return 'news';
+  return pathKind === 'warning' || pathKind === 'news' ? pathKind : null;
+}
+
+/**
+ * DMH's nil notice: a "Cyclone Warning" / "Cyclone News" whose whole text is
+ * "Nothing Special" (Burmese "မရှိပါ"). `text` is a body (one paragraph per
+ * line; an RSS copy starts with the title and "Issued at" lines).
+ */
+export function isNilCycloneBody(text, title = '') {
+  const t0 = cleanText(title);
+  const lines = String(text ?? '')
+    .split('\n')
+    .map(cleanText)
+    .filter((l) => l && l !== t0 && !(META_LINE.test(l) && l.length < 120));
+  const t = lines.join(' ');
+  if (!t || t.length > 200) return false;
+  return /\bnothing\s+special\b/i.test(t) || /^မရှိပါ/.test(t) || isNilBulletin(t);
 }
 
 /** {number, year} from "Deep Depression Warning, No.3, 2026" or "…အမှတ်စဉ်(၀၃/၂၀၂၆)". */
@@ -338,18 +382,25 @@ export function extractBulletinPage(html) {
 
 // EN headings seen in DMH warnings/news. `rest` after a heading is kept as
 // content when a heading and its paragraph share one line.
+// DMH's 2023 bulletins bracket their numbers: "During next (32) hours forecast".
 const EN_HEADINGS = [
   ['position', /^position of\b[^.]{0,80}?\b(?:wind|winds|pressure)\b\s*[:.\-–]?\s*/i],
-  ['forecast', /^(?:next\s+\d+\s*(?:hours|hrs)\.?\s*forecast|forecast\s+for\s+(?:the\s+)?next\s+\d+\s*(?:hours|hrs)\.?)\s*[:.\-–]?\s*/i],
+  ['forecast', /^(?:(?:during\s+)?(?:the\s+)?next\s*\(?\s*\d+\s*\)?\s*(?:hours|hrs)\.?\s*forecast|forecast\s+for\s+(?:the\s+)?next\s*\(?\s*\d+\s*\)?\s*(?:hours|hrs)\.?)\s*[:.\-–]?\s*/i],
   ['caution', /^(?:general\s+)?caution\s*[:.\-–]?\s*/i],
   ['advisory', /^(?:advisory|advice)\s*[:.\-–]?\s*/i],
 ];
+// Burmese headings are matched by their words first, with an optional
+// letter enumerator: the letters shift between bulletins ((ဃ) or (ဂ) can be
+// the caution heading), so the letter alone is only the last resort.
+const MY_ENUM = String.raw`(?:\(\s*[က-အ]\s*\)\s*)?`;
 const MY_HEADINGS = [
+  ['caution', new RegExp(`^${MY_ENUM}သတိပေးနှိုးဆော်ချက်\\s*`)],
+  ['advisory', new RegExp(`^${MY_ENUM}အကြံပြုချက်\\s*`)],
+  ['forecast', new RegExp(`^${MY_ENUM}နောက်\\s*\\(?\\s*[\\d၀-၉]+\\s*\\)?\\s*နာရီအတွင်း\\s*ခန့်မှန်းချက်\\s*`)],
+  ['position', new RegExp(`^${MY_ENUM}\\S*တည်နေရာ`)],
   ['condition', /^\(\s*က\s*\)\s*/],
   ['position', /^\(\s*ခ\s*\)\s*/],
-  ['forecast', /^\(\s*ဂ\s*\)\s*|^နောက်\s*[\d၀-၉]+\s*နာရီအတွင်း\s*ခန့်မှန်းချက်\s*/],
-  ['caution', /^သတိပေးနှိုးဆော်ချက်\s*/],
-  ['advisory', /^အကြံပြုချက်\s*/],
+  ['forecast', /^\(\s*ဂ\s*\)\s*/],
 ];
 const META_LINE = /^(?:issued at\b|ထုတ်ပြန်ချက်$)|မြန်မာစံတော်ချိန်\s*[\d၀-၉:]+\s*နာရီအချိန်\s*ထုတ်ပြန်ချက်$|\b(?:warning|news)\s*,?\s*no\s*\.?\s*\d+|အမှတ်စဉ်\s*\(/i;
 
@@ -454,22 +505,61 @@ function inRange(n, lo, hi) {
   return n != null && n >= lo && n <= hi ? n : null;
 }
 
+const STAGE_RANK = { green: 0, yellow: 1, orange: 2, red: 3, brown: 4 };
+const STAGE_WORD_EN = String.raw`(yellow|orange|red|brown|green)`;
+const STAGE_WORD_MY = '(အဝါ|လိမ္မော်|အနီ|အညို|အစိမ်း)';
+const MY_LETTERS = /(?<=[က-႟])\s+(?=[က-႟])/g;
+
+/**
+ * DMH colour stage and whether it applies to Yangon. Late in a storm DMH
+ * codes stages per region ("the present stage for Sagaing … is coded brown
+ * stage … for Rakhine and Chin States is coded green stage"): a clause
+ * naming Yangon wins; if the stages are scoped to other regions only, the
+ * most severe is kept for display with `scope: 'other-regions'`. Several
+ * unscoped stages: the most severe (a later "red" never loses to an earlier
+ * "green"). Burmese words split by a line-wrap space still match.
+ * @returns {{stage: string|null, scope: 'yangon'|'other-regions'|null}}
+ */
 function parseStage(en, myAscii) {
-  let m = /coded\s+as\s+(?:the\s+)?["'“‘]?\s*(yellow|orange|red|brown|green)\b/i.exec(en);
-  if (!m) m = /\b(yellow|orange|red|brown|green)\s+(?:emergency\s+|condition\s+)?stage\b/i.exec(en);
-  if (m) return m[1].toLowerCase();
-  const my = /(အဝါ|လိမ္မော်|အနီ|အညို|အစိမ်း)ရောင်\s*(?:အဆင့်|အရေးပေါ်)/.exec(myAscii) || /(အဝါ|လိမ္မော်|အနီ|အညို|အစိမ်း)ရောင်/.exec(myAscii);
-  return my ? STAGE_MY[my[1]] : null;
+  const scoped = [];
+  const unscoped = [];
+  for (const sentence of sentencesOf(en)) {
+    for (const m of sentence.matchAll(new RegExp(String.raw`stage\s+for\s+(.+?)\s+(?:is|are)\s+(?:coded|designated)\s+(?:as\s+)?(?:the\s+)?["'“‘]?\s*${STAGE_WORD_EN}\b`, 'gi'))) {
+      scoped.push({ stage: m[2].toLowerCase(), yangon: YANGON_EN.test(m[1]) });
+    }
+    const any = [
+      ...sentence.matchAll(new RegExp(String.raw`coded\s+as\s+(?:the\s+)?["'“‘]?\s*${STAGE_WORD_EN}\b`, 'gi')),
+      ...sentence.matchAll(new RegExp(String.raw`\b${STAGE_WORD_EN}\s+(?:emergency\s+|condition\s+)?stage\b`, 'gi')),
+    ];
+    if (!/stage\s+for\s+/i.test(sentence)) for (const m of any) unscoped.push(m[1].toLowerCase());
+  }
+  const my = String(myAscii || '').replace(MY_LETTERS, '');
+  for (const sentence of my.split('။')) {
+    const m = new RegExp(`${STAGE_WORD_MY}ရောင်(?:အဆင့်|အရေးပေါ်)?`).exec(sentence);
+    if (!m) continue;
+    const stage = STAGE_MY[m[1]];
+    // "ရန်ကုန်…တို့ကို … အညိုရောင်အဆင့်": a Burmese sentence that lists regions before the stage.
+    const regions = sentence.slice(0, m.index);
+    if (/တိုင်းဒေသကြီး|ပြည်နယ်/.test(regions) && /(?:တို့ကို|တို့အတွက်|အတွက်)/.test(regions)) scoped.push({ stage, yangon: YANGON_MY.test(regions), my: true });
+    else unscoped.push(stage);
+  }
+  const worst = (list) => list.reduce((a, b) => (a === null || STAGE_RANK[b] > STAGE_RANK[a] ? b : a), null);
+  const forYangon = scoped.filter((c) => c.yangon).map((c) => c.stage);
+  if (forYangon.length) return { stage: worst(forYangon), scope: 'yangon' };
+  if (unscoped.length) return { stage: worst(unscoped), scope: null };
+  if (scoped.length) return { stage: worst(scoped.map((c) => c.stage)), scope: 'other-regions' };
+  return { stage: null, scope: null };
 }
 
+// DMH's 2023 bulletins bracket every number: "Latitude (20.0) degree North", "(944) hPa", "(120-130) miles per hour".
 function parsePosition(en, myAscii) {
-  const m = /Latitude\s*([\d.]+)\s*°?\s*(?:degrees?)?\s*(North|South|N|S)\b[\s\S]{0,40}?Longitude\s*([\d.]+)\s*°?\s*(?:degrees?)?\s*(East|West|E|W)\b/i.exec(en);
+  const m = /Latitude\s*\(?\s*([\d.]+)\s*\)?\s*°?\s*(?:degrees?)?\s*(North|South|N|S)\b[\s\S]{0,40}?Longitude\s*\(?\s*([\d.]+)\s*\)?\s*°?\s*(?:degrees?)?\s*(East|West|E|W)\b/i.exec(en);
   if (m) {
     const lat = inRange(num(m[1]), 0, 90);
     const lon = inRange(num(m[3]), 0, 180);
     if (lat != null && lon != null) return { lat: /^s/i.test(m[2]) ? -lat : lat, lon: /^w/i.test(m[4]) ? -lon : lon };
   }
-  const y = /(မြောက်|တောင်)\s*လတ္တီကျု\s*([\d.]+)\s*ဒီဂရီ[\s\S]{0,40}?(အရှေ့|အနောက်)\s*လောင်ဂျီကျု\s*([\d.]+)/.exec(myAscii);
+  const y = /(မြောက်|တောင်)\s*လတ္တီကျု\s*\(?\s*([\d.]+)\s*\)?\s*ဒီဂရီ[\s\S]{0,40}?(အရှေ့|အနောက်)\s*လောင်ဂျီကျု\s*\(?\s*([\d.]+)/.exec(myAscii);
   if (y) {
     const lat = inRange(num(y[2]), 0, 90);
     const lon = inRange(num(y[4]), 0, 180);
@@ -480,10 +570,10 @@ function parsePosition(en, myAscii) {
 
 function parsePressure(enPos, en, myAscii) {
   for (const s of [enPos, en]) {
-    const m = /(\d{3,4})\s*hPa\b/i.exec(s);
+    const m = /\(?(\d{3,4})\)?\s*hPa\b/i.exec(s);
     if (m) return inRange(num(m[1]), 850, 1050);
   }
-  const y = /(\d{3,4})\s*ဟက်တိုပါစကယ်/.exec(myAscii);
+  const y = /\(?(\d{3,4})\)?\s*ဟက်တိုပါစကယ်/.exec(myAscii);
   return y ? inRange(num(y[1]), 850, 1050) : null;
 }
 
@@ -495,10 +585,10 @@ function windResult(text, a, b) {
 }
 
 function parseWind(enPos, en, myPosAscii) {
-  let m = /(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?\s*(?:miles\s+per\s+hour|mph)\b/i.exec(enPos);
-  if (!m) m = /(\d{1,3})(?:\s*(?:-|–|to)\s*(\d{1,3}))?\s*miles\s+per\s+hour/i.exec(en);
-  if (m) return windResult(m[0], m[1], m[2]);
-  const y = /တစ်နာရီ(?:လျှင်|ကို)\s*(?:မိုင်\s*)?(\d{1,3})\s*(?:မိုင်)?(?:\s*မှ\s*(?:မိုင်\s*)?(\d{1,3}))?/.exec(myPosAscii);
+  let m = /\(?(\d{1,3})\)?(?:\s*(?:-|–|to)\s*\(?(\d{1,3})\)?)?\s*(?:miles\s+per\s+hour|mph)\b/i.exec(enPos);
+  if (!m) m = /\(?(\d{1,3})\)?(?:\s*(?:-|–|to)\s*\(?(\d{1,3})\)?)?\s*miles\s+per\s+hour/i.exec(en);
+  if (m) return windResult(`${m[1]}${m[2] ? `-${m[2]}` : ''} mph`, m[1], m[2]);
+  const y = /တစ်နာရီ(?:လျှင်|ကို)\s*(?:မိုင်\s*)?\(?(\d{1,3})\)?\s*(?:မိုင်)?(?:\s*မှ\s*(?:မိုင်\s*)?\(?(\d{1,3}))?/.exec(myPosAscii);
   return y ? windResult(`${y[1]}${y[2] ? `-${y[2]}` : ''} mph`, y[1], y[2]) : null;
 }
 
@@ -527,11 +617,17 @@ function mentionsYangonIn(sections, re) {
   return sections.caution.some((p) => sentencesOf(p).some((s) => re.test(s) && SURGE.test(s)));
 }
 
-function isWeakening(enSections, mySections) {
-  const f = enSections.forecast.join(' ');
+/** "This is the last news/warning for the …" — DMH closes the series. */
+const FINAL_EN = /\bthis\s+is\s+the\s+(?:last|final)\s+(?:news|warning|bulletin)\b/i;
+
+function isWeakening(enSections, mySections, final = false) {
+  // Last bulletins have no forecast section: their condition text says where it goes.
+  const pick = (sec) => (sec.forecast.length ? sec.forecast : final ? sec.condition : []).join(' ');
+  const f = pick(enSections);
   if (/weaken|dissipat/i.test(f)) return true;
   if (/low\s+pressure\s+area/i.test(f) && !/intensif/i.test(f)) return true;
-  return /အားပျော့|ပျောက်ကွယ်/.test(mySections.forecast.join(' '));
+  if (final && f) return true;
+  return /အားပျော့|အားလျော့|ပျောက်ကွယ်/.test(pick(mySections));
 }
 
 /**
@@ -540,7 +636,7 @@ function isWeakening(enSections, mySections) {
  * @returns {object} DmhBulletin (see SPEC.md); `summary` omitted when `light`.
  */
 export function parseCycloneBulletin({ id = null, kind = null, titleEn = '', bodyEn = '', titleMy = '', bodyMy = '', url = null, postIso = null, light = false } = {}) {
-  const tEn = cleanText(titleEn);
+  const tEn = titleWords(titleEn);
   const tMy = cleanText(titleMy);
   const en = String(bodyEn || '');
   const my = String(bodyMy || '');
@@ -551,11 +647,12 @@ export function parseCycloneBulletin({ id = null, kind = null, titleEn = '', bod
   const enPos = cleanText(enSec.position.join(' '));
   const myPosAscii = burmeseDigitsToAscii(cleanText(mySec.position.join(' '))) || myAscii;
 
-  const stage = parseStage(enFlat, myAscii);
+  const { stage, scope } = parseStage(enFlat, myAscii);
   const { lat, lon } = parsePosition(enFlat, myAscii);
   const { number, year } = tEn ? numberFromTitle(tEn) : { number: null, year: null };
   const fromMy = numberFromTitle(tMy);
-  const k = kind || (url ? classifyLink(url) : null);
+  const k = kind || kindFromTitles(tEn, tMy, url ? classifyLink(url) : null);
+  const final = FINAL_EN.test(enFlat);
 
   const bulletin = {
     id: id != null ? String(id) : url ? nodeIdFromUrl(url) : null,
@@ -564,13 +661,16 @@ export function parseCycloneBulletin({ id = null, kind = null, titleEn = '', bod
     number: number ?? fromMy.number,
     year: year ?? fromMy.year,
     stage: STAGES.includes(stage) ? stage : null,
+    ...(scope === 'other-regions' ? { stageScope: 'other-regions' } : {}),
     issuedAt: toIso(postIso) ?? issuedFromText(enFlat),
     lat,
     lon,
     pressureHpa: parsePressure(enPos, enFlat, myPosAscii),
     windMph: parseWind(enPos, enFlat, myPosAscii),
-    mentionsYangon: mentionsYangonIn(enSec, YANGON_EN) || mentionsYangonIn(mySec, YANGON_MY),
-    weakening: isWeakening(enSec, mySec),
+    // A stage DMH scoped to other regions never counts as naming Yangon.
+    mentionsYangon: scope === 'other-regions' ? false : mentionsYangonIn(enSec, YANGON_EN) || mentionsYangonIn(mySec, YANGON_MY),
+    weakening: isWeakening(enSec, mySec, final),
+    final,
     title: { en: tEn || tMy, my: tMy || tEn },
     url: url ? langUrls(url) : { en: null, my: null },
   };
@@ -615,7 +715,7 @@ function newRecord(id, kind) {
 }
 
 function putTitle(rec, title, langHint) {
-  const t = cleanText(title);
+  const t = titleWords(title);
   if (!t || /^top announcement$/i.test(t)) return;
   const lang = isBurmese(t) ? 'my' : MYANMAR_SCRIPT.test(t) ? langHint : 'en';
   if (!rec[lang].title) rec[lang].title = t;
@@ -623,6 +723,11 @@ function putTitle(rec, title, langHint) {
 
 function pageKey(lang, kind, id) {
   return `${DMH_ORIGIN}/${lang}/${kind}/${id}`;
+}
+
+/** A listing link that is a bulletin entry rather than site navigation. */
+function isBulletinLink(link) {
+  return Boolean(link.postIso) || link.kind === 'top-announcement' || link.kind === 'warning' || isCycloneTitle(link.title) || classifyOtherWarning(link.title) !== null;
 }
 
 /** Index everything we know about each DMH node id from the fetched documents. */
@@ -650,7 +755,9 @@ export function collectRecords({ rssEn = null, rssMy = null, homeEn = null, home
   }
   for (const [lang, html, key] of [['en', homeEn, 'homeEn'], ['my', homeMy, 'homeMy'], ['en', cycloneNewsEn, 'cycloneNewsEn']]) {
     for (const link of parseListingLinks(html)) {
-      stats[key]++;
+      // Site chrome (e.g. a sidebar article linked from every page) must not
+      // make a page whose bulletin links no longer parse look healthy.
+      if (isBulletinLink(link)) stats[key]++;
       const r = get(link.id, link.kind);
       const linkLang = link.lang || lang;
       putTitle(r, link.title, linkLang);
@@ -680,6 +787,11 @@ function isCycloneRecord(r) {
   return (r.kind === 'warning' || r.kind === 'news') && (isCycloneTitle(r.en.title) || isCycloneTitle(r.my.title));
 }
 
+/** A DMH "Nothing Special" notice (in either language). */
+function isNilRecord(r) {
+  return isNilCycloneBody(r.en.body, r.en.title) || isNilCycloneBody(r.my.body, r.my.title);
+}
+
 function byPostDesc(a, b) {
   const d = Date.parse(b.postIso) - Date.parse(a.postIso);
   return d || Number(b.id) - Number(a.id);
@@ -705,15 +817,59 @@ function mergeTranslations(list) {
   return out;
 }
 
-function cycloneCandidates(records) {
-  return mergeTranslations([...records.values()].filter(isCycloneRecord).filter((r) => r.postIso).sort(byPostDesc));
+const HOUR_MS = 3600e3;
+// DMH types post dates by hand (fixtures: uploaded up to 8 h after the post date).
+const POST_AFTER_UPLOAD_MAX_MS = 6 * HOUR_MS;
+const POST_BEFORE_UPLOAD_MAX_MS = 48 * HOUR_MS;
+const FUTURE_TOLERANCE_MS = 6 * HOUR_MS;
+const CURRENT_MS = 24 * HOUR_MS;
+
+/**
+ * When a bulletin was issued: its typed post date, unless that is
+ * implausible next to its upload time (a day or year typo) or in the
+ * future; then the upload time (or when we first saw it), flagged estimated.
+ * Records with no date at all give null.
+ */
+function effectiveIssue(r, now, prevById = new Map()) {
+  const nowMs = +now;
+  const post = r.postIso ? Date.parse(r.postIso) : Number.NaN;
+  const created = r.createdIso ? Date.parse(r.createdIso) : Number.NaN;
+  if (Number.isFinite(post)) {
+    if (Number.isFinite(created) && (post > created + POST_AFTER_UPLOAD_MAX_MS || post < created - POST_BEFORE_UPLOAD_MAX_MS)) {
+      return { iso: toIso(Math.min(created, nowMs)), estimated: true };
+    }
+    if (post > nowMs + FUTURE_TOLERANCE_MS) {
+      const prev = prevById.get(r.id);
+      const firstSeen = prev?.issuedAtEstimated === true && Date.parse(prev.issuedAt) <= nowMs ? Date.parse(prev.issuedAt) : nowMs;
+      return { iso: toIso(firstSeen), estimated: true };
+    }
+    return { iso: toIso(post), estimated: false };
+  }
+  if (Number.isFinite(created)) return { iso: toIso(Math.min(created, nowMs)), estimated: true };
+  return null;
+}
+
+/**
+ * Cyclone bulletins with a usable issue time (`issuedIso`, `estimated`),
+ * newest first. Nil "Nothing Special" notices are left out.
+ */
+function cycloneCandidates(records, now = new Date(), prevById = new Map()) {
+  const dated = [...records.values()].filter((r) => isCycloneRecord(r) && !isNilRecord(r) && (r.postIso || r.createdIso)).sort(byPostDesc);
+  const out = [];
+  for (const r of mergeTranslations(dated)) {
+    const eff = effectiveIssue(r, now, prevById);
+    if (eff) out.push({ ...r, issuedIso: eff.iso, estimated: eff.estimated });
+  }
+  return out.sort((a, b) => Date.parse(b.issuedIso) - Date.parse(a.issuedIso) || Number(b.id) - Number(a.id));
 }
 
 /**
  * Which bulletin pages still need fetching: cyclone bulletins seen only on a
- * listing (no post date yet), then the missing language bodies of the newest.
+ * listing (no date yet), then the missing language bodies of every current
+ * one (DMH can run several series at once, and a nil "Nothing Special"
+ * notice is only recognised from its body).
  */
-export function pagesToFetch(inputs, { limit = RECENT_MAX, attempted = new Set() } = {}) {
+export function pagesToFetch(inputs, { limit = RECENT_MAX, attempted = new Set(), now = new Date() } = {}) {
   const { records } = collectRecords(inputs);
   const want = [];
   const add = (url) => {
@@ -723,10 +879,16 @@ export function pagesToFetch(inputs, { limit = RECENT_MAX, attempted = new Set()
     .filter((r) => isCycloneRecord(r) && !r.postIso && !attempted.has(pageKey('en', r.kind, r.id)))
     .sort((a, b) => (a.kind === b.kind ? Number(b.id) - Number(a.id) : a.kind === 'warning' ? -1 : 1));
   for (const r of undated.slice(0, 3)) add(pageKey('en', r.kind, r.id));
-  // Only once every candidate has a date do we know which one is newest.
+  // Only once every candidate has a date do we know which ones are current.
   if (!want.length) {
-    const newest = cycloneCandidates(records)[0];
-    if (newest) for (const lang of ['en', 'my']) if (!newest[lang].body) add(pageKey(lang, newest.kind, newest.id));
+    const candidates = cycloneCandidates(records, now);
+    // Only bulletins still in force (not replaced by a newer one about the same system).
+    const { inForce } = rankDmhBulletins(candidates.map((r) => recordToBulletin(r, true)), { now, checkedAt: now });
+    const live = new Set(inForce.map((b) => b.id));
+    const current = candidates.filter((r) => live.has(r.id) && +now - Date.parse(r.issuedIso) <= CURRENT_MS);
+    for (const r of current.length ? current : candidates.slice(0, 1)) {
+      for (const lang of ['en', 'my']) if (!r[lang].body) add(pageKey(lang, r.kind, r.id));
+    }
   }
   return want.slice(0, Math.max(0, limit));
 }
@@ -734,8 +896,17 @@ export function pagesToFetch(inputs, { limit = RECENT_MAX, attempted = new Set()
 function recordToBulletin(r, light) {
   const url = r.en.url || r.my.url || pageKey('en', r.kind, r.id);
   const b = parseCycloneBulletin({
-    id: r.id, kind: r.kind, titleEn: r.en.title, bodyEn: r.en.body, titleMy: r.my.title, bodyMy: r.my.body, url, postIso: r.postIso, light,
+    id: r.id,
+    kind: kindFromTitles(r.en.title, r.my.title, r.kind),
+    titleEn: r.en.title,
+    bodyEn: r.en.body,
+    titleMy: r.my.title,
+    bodyMy: r.my.body,
+    url,
+    postIso: r.issuedIso ?? r.postIso,
+    light,
   });
+  if (r.estimated) b.issuedAtEstimated = true;
   // Separate EN/MY nodes keep their own URLs.
   if (r.en.url && r.my.url && nodeIdFromUrl(r.en.url) !== nodeIdFromUrl(r.my.url)) {
     b.url = { en: langUrls(r.en.url).en, my: langUrls(r.my.url).my };
@@ -833,19 +1004,38 @@ function failure({ previous, errors, now }) {
     attemptedAt: toIso(now),
     ok: false,
     errors,
+    partial: prev?.partial === true,
     cyclone: prev?.cyclone ?? null,
     recentCyclone: Array.isArray(prev?.recentCyclone) ? prev.recentCyclone : [],
+    undatedCyclone: Array.isArray(prev?.undatedCyclone) ? prev.undatedCyclone : [],
     announcement: prev?.announcement ?? null,
     otherWarnings: Array.isArray(prev?.otherWarnings) ? prev.otherWarnings : [],
   };
 }
 
+/** A previous bulletin re-used in this run; a post date in the future becomes the time we last saw it. */
+function carryPrevious(b, prev, now) {
+  if (Date.parse(b.issuedAt) <= +now + FUTURE_TOLERANCE_MS) return b;
+  const seen = Date.parse(prev?.checkedAt);
+  return { ...b, issuedAt: toIso(Number.isFinite(seen) && seen <= +now ? seen : now), issuedAtEstimated: true };
+}
+
+const newestFirst = (a, b) => Date.parse(b.issuedAt) - Date.parse(a.issuedAt) || Number(b.id) - Number(a.id);
+
 /**
  * Assemble data/dmh.json (schema 1) from whatever documents were fetched
  * (null = failed). Keeps the previous content, with ok:false and the old
  * checkedAt, when nothing usable came back.
+ *
+ * `cyclone` is the bulletin that matters most for Yangon among those still
+ * in force (DMH can run a Warning for one system and a News for another at
+ * the same time; see js/risk.js `inForceDmh`), else the newest. Previous
+ * bulletins that scrolled out of the feeds still count while current.
+ * Cyclone bulletins DMH lists but whose date could not be read are listed in
+ * `undatedCyclone` with `partial: true` (the page then says DMH could not be
+ * fully checked) instead of being dropped silently.
  */
-export function buildDmhJson({ rssEn = null, rssMy = null, homeEn = null, homeMy = null, cycloneNewsEn = null, pages = {}, errors = [], now = new Date(), previous = null } = {}) {
+export function buildDmhJson({ rssEn = null, rssMy = null, homeEn = null, homeMy = null, cycloneNewsEn = null, pages = {}, errors = [], now = new Date(), previous = null, home = HOME } = {}) {
   const errs = [...errors];
   const { records, stats } = collectRecords({ rssEn, rssMy, homeEn, homeMy, cycloneNewsEn, pages });
   for (const [key, doc] of Object.entries({ rssEn, rssMy, homeEn, homeMy, cycloneNewsEn })) {
@@ -855,30 +1045,40 @@ export function buildDmhJson({ rssEn = null, rssMy = null, homeEn = null, homeMy
   if (!usable) return failure({ previous, errors: errs, now });
 
   const prev = previous && typeof previous === 'object' && previous.schema === 1 ? previous : null;
-  const candidates = cycloneCandidates(records);
-  for (const r of records.values()) {
-    if (isCycloneRecord(r) && !r.postIso) errs.push(`cyclone bulletin ${r.kind}/${r.id} has no issue time; skipped`);
-  }
+  const prevList = [prev?.cyclone, ...(Array.isArray(prev?.recentCyclone) ? prev.recentCyclone : [])].filter((b) => isBulletinLike(b) && b.id);
+  const prevById = new Map();
+  for (const b of prevList) if (!prevById.has(b.id)) prevById.set(b.id, b);
 
-  let cyclone = candidates[0] ? fillFromPrevious(recordToBulletin(candidates[0], false), prev?.cyclone) : null;
-  // A bulletin that has scrolled out of the feeds is still the latest word.
-  if (isBulletinLike(prev?.cyclone) && (!cyclone || Date.parse(prev.cyclone.issuedAt) > Date.parse(cyclone.issuedAt))) {
-    cyclone = prev.cyclone;
-  }
+  const candidates = cycloneCandidates(records, now, prevById);
+  for (const r of candidates) if (r.estimated) errs.push(`cyclone bulletin ${r.kind}/${r.id}: post date ${r.postIso ?? 'missing'} looks wrong; using ${r.issuedIso}`);
+  const newestId = candidates.reduce((m, r) => Math.max(m, Number(r.id) || 0), 0);
+  const undated = [...records.values()].filter((r) => isCycloneRecord(r) && !r.postIso && !r.createdIso && !isNilRecord(r));
+  for (const r of undated) errs.push(`cyclone bulletin ${r.kind}/${r.id} has no issue time; listed as unread`);
+  // Node ids follow upload order: an undated bulletin newer than every dated one may be the one that matters.
+  const unread = undated.filter((r) => !candidates.length || Number(r.id) > newestId).sort((a, b) => Number(b.id) - Number(a.id));
 
-  const recent = new Map();
-  for (const r of candidates) {
-    if (recent.size >= RECENT_MAX * 2) break;
-    const b = recordToBulletin(r, true);
-    if (isBulletinLike(b)) recent.set(b.id, b);
+  const all = new Map();
+  for (const r of candidates.slice(0, RECENT_MAX * 2)) {
+    const b = recordToBulletin(r, false);
+    if (isBulletinLike(b)) all.set(b.id, fillFromPrevious(b, prevById.get(b.id)));
   }
-  if (cyclone) recent.set(cyclone.id, lighten(cyclone));
-  for (const b of Array.isArray(prev?.recentCyclone) ? prev.recentCyclone : []) {
-    if (isBulletinLike(b) && b.id && !recent.has(b.id)) recent.set(b.id, lighten(b));
+  for (const b of prevList) if (!all.has(b.id)) all.set(b.id, carryPrevious(b, prev, now));
+  const list = [...all.values()].sort(newestFirst);
+
+  const { inForce, lead } = rankDmhBulletins(list, { home, now, checkedAt: now });
+  const leadId = lead?.id ?? null;
+  let cyclone = leadId != null && all.has(leadId) ? all.get(leadId) : (list[0] ?? null);
+  if (cyclone && !cyclone.summary) cyclone = { ...cyclone, summary: { en: '', my: '' } };
+
+  const recentCyclone = [];
+  const seen = new Set();
+  const cap = Math.max(RECENT_MAX, inForce.length);
+  for (const b of [...inForce.map((x) => all.get(x.id)), ...list]) {
+    if (!b || seen.has(b.id) || recentCyclone.length >= cap) continue;
+    seen.add(b.id);
+    recentCyclone.push(lighten(b));
   }
-  const recentCyclone = [...recent.values()]
-    .sort((a, b) => Date.parse(b.issuedAt) - Date.parse(a.issuedAt) || Number(b.id) - Number(a.id))
-    .slice(0, RECENT_MAX);
+  recentCyclone.sort(newestFirst);
 
   return {
     schema: 1,
@@ -887,8 +1087,13 @@ export function buildDmhJson({ rssEn = null, rssMy = null, homeEn = null, homeMy
     attemptedAt: toIso(now),
     ok: true,
     errors: errs,
+    partial: unread.length > 0,
     cyclone,
     recentCyclone,
+    undatedCyclone: unread.map((r) => {
+      const urls = langUrls(r.en.url || r.my.url || pageKey('en', r.kind, r.id));
+      return { id: r.id, kind: kindFromTitles(r.en.title, r.my.title, r.kind), title: { en: r.en.title || r.my.title, my: r.my.title || r.en.title }, url: urls };
+    }),
     announcement: buildAnnouncement(records, prev),
     otherWarnings: buildOtherWarnings(records),
   };

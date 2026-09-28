@@ -50,9 +50,15 @@ test('bulletin is current up to THRESHOLDS.dmh.currentHours, not 25 h later', ()
   const at = (h) => new Date(ISSUED.getTime() + h * 3600e3);
   assert.equal(evaluateDmh(json, HOME, at(THRESHOLDS.dmh.currentHours)).bulletin.isCurrent, true);
   assert.equal(evaluateDmh(json, HOME, at(25)).bulletin.isCurrent, false);
-  // A post date far in the future (typo) must not stay "current".
+  // A post date far in the future is a typo: counted from when our check saw
+  // it, never silently dropped, and flagged so the page cannot say Calm.
   const future = { ...json, cyclone: { ...json.cyclone, issuedAt: '2027-09-28T12:30:00Z' } };
-  assert.equal(evaluateDmh(future, HOME, CHECKED).bulletin.isCurrent, false);
+  const s = evaluateDmh(future, HOME, CHECKED);
+  assert.equal(s.bulletin.isCurrent, true);
+  assert.equal(s.bulletin.dateSuspect, true);
+  assert.equal(s.dateSuspect, true);
+  assert.deepEqual(s.bulletin.effectiveIssuedDate, CHECKED);
+  assert.equal(evaluateDmh(future, HOME, new Date(CHECKED.getTime() + 25 * 3600e3)).bulletin.isCurrent, false, 'a day after our check');
 });
 
 test('checkStale follows STALE_AFTER_MS.dmhCheck', () => {

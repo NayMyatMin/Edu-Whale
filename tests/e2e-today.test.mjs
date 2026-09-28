@@ -18,7 +18,7 @@ import { HOME, URLS } from '../js/config.js';
 import { buildDmhJson } from '../scripts/lib/dmh-parse.mjs';
 import { evaluateDmh, evaluateOverride } from '../js/dmh.js';
 import { fetchJtwc } from '../js/jtwc.js';
-import { fetchGdacs } from '../js/gdacs.js';
+import { clearGdacsCache, fetchGdacs } from '../js/gdacs.js';
 import { normalizeWeather } from '../js/weather.js';
 import { analyzeSystem, mergeSystems, sortAnalyses } from '../js/systems.js';
 import { assessRisk, stormThreat } from '../js/risk.js';
@@ -67,6 +67,7 @@ function jtwcRoutes() {
 
 /** Serve fixtures; anything else is a 404. `down` = regexes that fail like a dead network. */
 function stubFetch(routes, { down = [] } = {}) {
+  clearGdacsCache(); // episode detail is cached per module; each test serves its own network
   const calls = [];
   globalThis.fetch = async (input) => {
     const url = String(input?.url ?? input);

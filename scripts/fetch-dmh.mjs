@@ -101,11 +101,12 @@ async function loadPrevious(ref, fetcher) {
     console.warn(`fetch-dmh: previous ${ref} is not schema 1; ignoring it`);
   } catch (err) {
     console.warn(`fetch-dmh: no previous data from ${ref}: ${describeError(err)}`);
+    console.log(`::warning title=No previous DMH data::${ref} could not be read (${describeError(err)}); a DMH outage now would leave the site without the last bulletin.`);
   }
   return null;
 }
 
-async function collect(fetchText) {
+async function collect(fetchText, now) {
   const errors = [];
   const get = async (key, url) => {
     try {
@@ -128,7 +129,7 @@ async function collect(fetchText) {
   const attempted = new Set();
   let budget = MAX_PAGE_FETCHES;
   for (let round = 0; round < 3 && budget > 0; round++) {
-    const want = pagesToFetch(inputs, { limit: budget, attempted });
+    const want = pagesToFetch(inputs, { limit: budget, attempted, now });
     if (!want.length) break;
     budget -= want.length;
     for (const url of want) attempted.add(url);
@@ -146,7 +147,10 @@ async function collect(fetchText) {
 function summaryLine(json) {
   const c = json.cyclone;
   const what = c ? `${c.title?.en || c.id} (${c.kind}${c.stage ? `, ${c.stage} stage` : ''}) issued ${c.issuedAt}` : 'no cyclone bulletin';
-  return `DMH ${json.ok ? 'ok' : 'UNREACHABLE (kept previous data)'}: ${what}; ${json.otherWarnings.length} other warning(s); ${json.errors.length} error(s)`;
+  let state = 'ok';
+  if (!json.ok) state = json.checkedAt ? 'UNREACHABLE (kept previous data)' : 'UNREACHABLE (no previous data)';
+  else if (json.partial) state = 'ok but PARTIAL (a listed cyclone bulletin could not be read)';
+  return `DMH ${state}: ${what}; ${json.otherWarnings.length} other warning(s); ${json.errors.length} error(s)`;
 }
 
 async function main() {
@@ -165,7 +169,7 @@ async function main() {
   try {
     // --previous is the deployed site's copy: read it with the live fetcher even in fixture mode.
     previous = await loadPrevious(args.previous, fetchLive);
-    const { inputs, errors, pageFetches } = await collect(fetchText);
+    const { inputs, errors, pageFetches } = await collect(fetchText, now);
     json = buildDmhJson({ ...inputs, errors, now, previous });
     console.log(`fetch-dmh: ${pageFetches} bulletin page fetch(es)`);
   } catch (err) {
@@ -179,6 +183,7 @@ async function main() {
   console.log(summaryLine(json));
   for (const e of json.errors) console.log(`  - ${e}`);
   if (!json.ok) console.log(`::warning title=DMH check failed::${json.errors[0] || 'unknown error'}`);
+  else if (json.partial) console.log(`::warning title=DMH check incomplete::${json.errors.find((e) => /no issue time/.test(e)) || 'a listed cyclone bulletin could not be read'}`);
 }
 
 main().catch((err) => {

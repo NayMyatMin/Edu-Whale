@@ -3,7 +3,7 @@
 // limitations, disclaimer, attribution and demo links.
 
 import { DMH_STAGES, JTWC_CLASSES, KT_TO_KMH, REFRESH_MS, STALE_AFTER_MS, THRESHOLDS } from '../config.js';
-import { formatNumber, t, tFormat } from '../i18n.js';
+import { formatDistance, formatNumber, t, tFormat } from '../i18n.js';
 import { extLink, fill, h, levelPill } from './dom.js';
 import { levelName, listFormat } from './status.js';
 
@@ -14,13 +14,6 @@ const W = THRESHOLDS.weather;
 const D = THRESHOLDS.dmh;
 const TS_KMH = JTWC_CLASSES.find((c) => c.key === 'TS').minKt * KT_TO_KMH;
 const HU_KMH = JTWC_CLASSES.find((c) => c.key === 'HU').minKt * KT_TO_KMH;
-
-// In DMH's own order: Yellow → Orange → Red → Brown → Green.
-function stagesAt(level, index) {
-  return Object.keys(DMH_STAGES)
-    .filter((stage) => D.stageFloor[stage]?.[index] === level)
-    .map((stage) => t(`dmh.stage.${stage}`));
-}
 
 function weatherRule(band) {
   const th = W[band] ?? {};
@@ -34,12 +27,30 @@ function weatherRule(band) {
   return parts.length ? tFormat('about.rule.weather', { hours: W.horizonHours, list: listFormat(parts, 'disjunction') }) : null;
 }
 
+/**
+ * DMH stage rules for one level, grouped by the distance bands where each
+ * stage gives that level (in DMH's own order: Yellow → Orange → Red → Brown
+ * → Green). Bands: 0 = within dangerKm (dangerKmWeak for lows and
+ * depressions) or naming Yangon, 1 = within nearKm, 2 = further away.
+ */
 function dmhRules(level) {
+  const groups = new Map();
+  for (const stage of Object.keys(DMH_STAGES)) {
+    const floors = D.stageFloor[stage];
+    if (!floors) continue;
+    const sig = [0, 1, 2].filter((i) => floors[i] === level).join('');
+    if (!sig) continue;
+    if (!groups.has(sig)) groups.set(sig, []);
+    groups.get(sig).push(t(`dmh.stage.${stage}`));
+  }
   const out = [];
-  const near = stagesAt(level, 0);
-  const far = stagesAt(level, 1).filter((s) => !near.includes(s));
-  if (near.length) out.push(tFormat('about.rule.dmhNear', { stages: listFormat(near, 'disjunction'), km: D.nearKm }));
-  if (far.length) out.push(tFormat('about.rule.dmhFar', { stages: listFormat(far, 'disjunction'), km: D.nearKm }));
+  for (const [sig, names] of groups) {
+    const stages = listFormat(names, 'disjunction');
+    if (sig === '0') out.push(tFormat('about.rule.dmhDanger', { stages, km: D.dangerKm, kmWeak: formatDistance(D.dangerKmWeak) }));
+    else if (sig === '01') out.push(tFormat('about.rule.dmhNear', { stages, km: D.nearKm }));
+    else if (sig === '012') out.push(tFormat('about.rule.dmhAny', { stages }));
+    else out.push(tFormat('about.rule.dmhFar', { stages, km: D.nearKm }));
+  }
   if (D.newsFloor === level) out.push(tFormat('about.rule.dmhNews'));
   if (D.otherWarningFloor === level) out.push(tFormat('about.rule.dmhOther'));
   return out;
@@ -54,7 +65,7 @@ export function levelRules() {
         ...dmhRules(3),
         tFormat('about.rule.trackTS', { kmh: TS_KMH, km: S.danger.trackKmTS, hours: S.danger.trackHoursTS }),
         tFormat('about.rule.trackHU', { kmh: HU_KMH, km: S.danger.trackKmHU, hours: S.danger.trackHoursHU }),
-        tFormat('about.rule.insideWind', { kmh: S.danger.insideSwathKmh }),
+        tFormat('about.rule.insideWind', { kmh: S.danger.insideSwathKmh, hours: S.danger.insideSwathHours }),
         weatherRule('danger'),
       ],
     },
@@ -65,8 +76,9 @@ export function levelRules() {
         tFormat('about.rule.trackAny', { km: S.prepare.trackKmAny, hours: S.prepare.trackHoursAny }),
         tFormat('about.rule.current', { km: S.prepare.currentKm }),
         tFormat('about.rule.trackHU', { kmh: HU_KMH, km: S.prepare.trackKmHU, hours: S.prepare.trackHoursHU }),
-        tFormat('about.rule.insideWindOrCone', { kmh: S.prepare.insideSwathKmh }),
+        tFormat('about.rule.insideWindOrCone', { kmh: S.prepare.insideSwathKmh, hours: S.prepare.insideSwathHours }),
         tFormat('about.rule.tcfa', { km: S.prepare.tcfaKm }),
+        tFormat('about.rule.tcfaNoArea', { km: S.prepare.tcfaNoCorridorKm }),
         weatherRule('prepare'),
       ],
     },
@@ -80,7 +92,7 @@ export function levelRules() {
         weatherRule('monitor'),
       ],
     },
-    { level: 0, rules: [tFormat('about.rule.calm')] },
+    { level: 0, rules: [tFormat('about.rule.calm', { hours: STALE_AFTER_MS.dmhCheck / 3600e3 })] },
     { level: null, rules: [tFormat('about.rule.unknown', { hours: STALE_AFTER_MS.dmhCheck / 3600e3 })] },
   ].map((row) => ({ ...row, rules: row.rules.filter(Boolean) }));
 }
@@ -89,7 +101,7 @@ function levelTable() {
   return h(
     'table',
     { class: 'level-table' },
-    h('caption', { class: 'visually-hidden', text: t('about.tableCaption') }),
+    h('caption', { class: 'visually-hidden', id: 'level-table-caption', text: t('about.tableCaption') }),
     h('thead', {}, h('tr', {}, h('th', { scope: 'col', text: t('about.col.level') }), h('th', { scope: 'col', text: t('about.col.when') }))),
     h(
       'tbody',
@@ -132,7 +144,7 @@ export function renderAbout(el) {
     para('about.cadence', { minutes: formatNumber(REFRESH_MS / 60000) }),
     h('h3', { text: t('about.levelsTitle') }),
     para('about.levelsIntro'),
-    h('div', { class: 'table-scroll' }, levelTable()),
+    h('div', { class: 'table-scroll', role: 'region', tabindex: '0', 'aria-labelledby': 'level-table-caption' }, levelTable()),
     h('p', { class: 'muted small', text: tFormat('about.levelsNote', { hours: D.currentHours, km: D.nearKm }) }),
     para('about.override'),
     h('h3', { text: t('about.limitsTitle') }),

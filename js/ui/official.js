@@ -169,8 +169,50 @@ function otherWarnings(list, now) {
   );
 }
 
-function recentList(recent, currentId, now) {
-  const items = (recent ?? []).filter((r) => r.id !== currentId);
+/** Other DMH bulletins still in force (DMH can run series for two systems at once). */
+function alsoInForce(list, now) {
+  if (!list?.length) return null;
+  return h(
+    'section',
+    { class: 'dmh-sub', 'aria-labelledby': 'dmh-also-title' },
+    h('h3', { id: 'dmh-also-title', text: t('official.alsoInForce') }),
+    h(
+      'ul',
+      { class: 'other-list' },
+      list.map((r) => {
+        const url = pickLang(r.url);
+        const title = pickLang(r.title) || t(`dmh.system.${r.system ?? 'unknown'}`);
+        const where = r.distanceKm != null ? ` · ${t('dmh.position.from', { dist: formatDistance(r.distanceKm), dir: compassLabel(r.compassFromHome) })}` : '';
+        return h(
+          'li',
+          {},
+          url ? extLink(url, title, { lang: langOf(r.title) }) : h('span', { lang: langOf(r.title), text: title }),
+          r.stage ? stageChip(r.stage, { withMeaning: false, small: true }) : null,
+          h('span', { class: 'muted small', text: ` ${formatWhen(r.issuedAtDate, now)}${where}` }),
+        );
+      }),
+    ),
+  );
+}
+
+/** Cyclone bulletins DMH lists that our automatic check could not read. */
+function undatedNotice(list) {
+  if (!list?.length) return null;
+  return h(
+    'div',
+    { class: 'notice notice-warn' },
+    icon('alert', { size: 20 }),
+    h(
+      'div',
+      {},
+      h('p', { text: t('official.undated') }),
+      h('ul', { class: 'other-list' }, list.map((u) => h('li', {}, extLink(pickLang(u.url) || DMH_LINKS.cycloneEn, pickLang(u.title) || t('official.openDmh'), { lang: langOf(u.title) })))),
+    ),
+  );
+}
+
+function recentList(recent, skipIds, now) {
+  const items = (recent ?? []).filter((r) => !skipIds.has(r.id));
   if (!items.length) return null;
   return h(
     'details',
@@ -220,8 +262,9 @@ export function renderOfficial(el, dmh, ctx = {}) {
   const parts = [];
 
   if (!dmh || !dmh.available) {
+    const key = ctx.fetchState === 'loading' ? 'official.loading' : ctx.fetchState === 'missing' ? 'official.notSetUp' : 'official.unreachable';
     parts.push(
-      notice('warn', ctx.fetchState === 'missing' ? t('official.notSetUp') : t('official.unreachable')),
+      notice(ctx.fetchState === 'loading' ? 'info' : 'warn', t(key)),
       h('p', {}, extLink(lang === 'my' ? DMH_LINKS.cycloneMy : DMH_LINKS.cycloneEn, t('official.openCyclone'), { className: 'btn btn-primary' })),
     );
   } else {
@@ -230,11 +273,17 @@ export function renderOfficial(el, dmh, ctx = {}) {
     } else if (ctx.fetchState === 'error' || ctx.fetchState === 'cached') {
       parts.push(notice('info', t('official.savedCopy')));
     }
-    const b = dmh.bulletin;
-    parts.push(b && b.isCurrent ? currentBulletin(b, now) : noCurrent(b, now));
-    parts.push(announcement(dmh.announcement, now, Boolean(b && b.isCurrent)));
+    parts.push(undatedNotice(dmh.undated));
+    // Lead with the bulletin that matters most for Yangon among those in force.
+    const b = dmh.lead ?? dmh.bulletin;
+    const current = Boolean(b && b.isCurrent);
+    if (current && b.dateSuspect) parts.push(notice('warn', t('official.dateSuspect')));
+    parts.push(current ? currentBulletin(b, now) : noCurrent(dmh.bulletin, now));
+    const others = (dmh.inForce ?? []).filter((x) => x.id !== b?.id);
+    if (current) parts.push(alsoInForce(others, now));
+    parts.push(announcement(dmh.announcement, now, current));
     parts.push(otherWarnings(dmh.otherWarnings, now));
-    parts.push(recentList(dmh.recent, b?.id ?? null, now));
+    parts.push(recentList(dmh.recent, new Set([b?.id, ...others.map((x) => x.id)]), now));
     parts.push(
       h(
         'p',

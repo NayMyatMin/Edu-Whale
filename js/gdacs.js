@@ -6,7 +6,7 @@
 import { HOME, REGION_BBOX, URLS } from './config.js';
 import { haversineKm, inBbox, wrapLonDelta } from './geo.js';
 import { fetchJson, mapLimit } from './net.js';
-import { jtwcClassOf, titleCase } from './systems.js';
+import { classMinWindKt, jtwcClassOf, titleCase } from './systems.js';
 
 const MS_TO_KT = 1.943844;
 const HOUR_MS = 3600e3;
@@ -15,6 +15,10 @@ const LOOKBACK_DAYS = 14;
 const ACTIVE_MAX_AGE_MS = 24 * HOUR_MS;
 // Only storms this close (or inside REGION_BBOX) get the heavier detail fetches.
 const DETAIL_RADIUS_KM = 4000;
+// A failed detail fetch for a storm this close (or in REGION_BBOX) is a gap in coverage.
+const DETAIL_MATTERS_KM = 2500;
+// Geometry and timeline only change with a new GDACS episode: keep them per episode.
+const EPISODE_CACHE_MAX = 12;
 const MAX_IN_FLIGHT = 4;
 // Track circles are centred exactly on the point (research: ≤ 0.01° error).
 const MATCH_TOL_DEG = 0.02;
@@ -184,12 +188,14 @@ function clsFromStatus(text) {
   return null;
 }
 
-/** 'SURIGAE-26' / 'Tropical Cyclone SURIGAE-26' → 'Surigae'. */
+/** 'SURIGAE-26' / 'Tropical Cyclone SURIGAE-26' → 'Surigae'. Markup and control characters are dropped. */
 function displayName(s) {
   const bare = String(s ?? '')
+    .replace(/[<>\u0000-\u001f\u007f]/g, '')
     .replace(/^\s*tropical\s+cyclone\s+/i, '')
     .replace(/-\d{2}\s*$/, '')
-    .trim();
+    .trim()
+    .slice(0, 40);
   return titleCase(bare);
 }
 
@@ -251,6 +257,7 @@ export function parseGeometry(json) {
       forecast: advisoryTime ? time > advisoryTime : false,
       windKt: null,
       cls: null,
+      clsMatched: false,
     });
   }
   points.sort((a, b) => a.time - b.time); // stable: keeps N order on ties
@@ -281,7 +288,10 @@ function assignLineClasses(points, lines) {
           const k = Math.max(i, j);
           if (target < 0 || (points[target].cls && !points[k].cls)) target = k;
         }
-    if (target > 0 && !points[target].cls) points[target].cls = label;
+    if (target > 0 && !points[target].cls) {
+      points[target].cls = label;
+      points[target].clsMatched = true;
+    }
   }
   for (let i = 1; i < points.length; i++) if (!points[i].cls) points[i].cls = points[i - 1].cls;
   for (let i = points.length - 2; i >= 0; i--) if (!points[i].cls) points[i].cls = points[i + 1].cls;
@@ -330,7 +340,12 @@ export function parseTimeline(json) {
 // TropicalSystem
 // ---------------------------------------------------------------------------
 
-/** Merge timeline wind into geometry points by index (when times agree) or by time. */
+/**
+ * Merge timeline wind into geometry points by index (when times agree) or by
+ * time. Without a wind value, a TS/HU label that came from GDACS's own line
+ * for that point becomes `windKtMin` (34/64 kt), so risk.js still knows the
+ * storm is at least that strong.
+ */
 function mergeTrack(points, timeline) {
   const fromTimeline = (t) => ({
     time: t.time,
@@ -347,7 +362,10 @@ function mergeTrack(points, timeline) {
   return points.map((p, i) => {
     const t = sameIndex ? timeline[i] : byTime.get(p.time.getTime());
     const windKt = t?.windKt ?? null;
-    return { time: p.time, lat: p.lat, lon: p.lon, forecast: p.forecast, windKt, cls: jtwcClassOf(windKt) ?? p.cls };
+    const out = { time: p.time, lat: p.lat, lon: p.lon, forecast: p.forecast, windKt, cls: jtwcClassOf(windKt) ?? p.cls };
+    const floor = windKt === null && p.clsMatched ? classMinWindKt(p.cls) : null;
+    if (floor !== null) out.windKtMin = floor;
+    return out;
   });
 }
 
@@ -396,6 +414,12 @@ export function toSystem(event, geometry = null, timeline = null) {
   if (!track.length && position.time) {
     track = [{ time: position.time, lat: position.lat, lon: position.lon, forecast: false, windKt: null, cls: event.statusCls ?? null }];
   }
+  // Wind unknown but the class at the current position is: its floor (never the event's lifetime maximum).
+  let windKtMin = null;
+  if (windKt === null && position.time) {
+    const here = track.find((p) => +p.time === +position.time);
+    windKtMin = Number.isFinite(here?.windKtMin) ? here.windKtMin : null;
+  }
 
   const issued = [geo?.advisoryTime, event.toDate].filter((d) => d instanceof Date);
   return {
@@ -408,6 +432,7 @@ export function toSystem(event, geometry = null, timeline = null) {
     issuedAt: issued.length ? new Date(Math.max(...issued.map(Number))) : null,
     position,
     windKt,
+    windKtMin,
     gustKt,
     movement: null, // analyzeSystem derives it from the last two observed points
     potential: null,
@@ -430,6 +455,11 @@ function wantsDetail(ev, home) {
   return haversineKm(home, ev) <= DETAIL_RADIUS_KM || inBbox(ev, REGION_BBOX);
 }
 
+/** Close enough that missing detail (track, wind) weakens the attention level. */
+function detailMatters(ev, home) {
+  return haversineKm(home, ev) <= DETAIL_MATTERS_KM || inBbox(ev, REGION_BBOX);
+}
+
 function geometryUrl(ev) {
   const ep = ev.episodeId !== null ? `&episodeid=${ev.episodeId}` : '';
   return `${URLS.gdacsBase}/polygons/getgeometry?eventtype=TC&eventid=${ev.eventId}${ep}`;
@@ -448,9 +478,19 @@ function timelineUrlFrom(eventData, source) {
 
 const errText = (e) => (e && e.message) || String(e);
 
+// Parsed geometry + timeline per `${eventId}:${episodeId}` (only complete ones are kept).
+const episodeCache = new Map();
+
+/** Forget cached episode detail (tests). */
+export function clearGdacsCache() {
+  episodeCache.clear();
+}
+
 /**
- * Current GDACS systems. Never throws.
- * @returns {Promise<{systems: object[], ok: boolean, error?: string, errors: string[]}>}
+ * Current GDACS systems. Never throws. `partial` is true when the track or
+ * wind detail of a storm near Myanmar could not be loaded: the systems are
+ * still usable, but GDACS coverage is incomplete.
+ * @returns {Promise<{systems: object[], ok: boolean, partial?: boolean, error?: string, errors: string[]}>}
  */
 export async function fetchGdacs(now = new Date(), home = HOME) {
   let events;
@@ -460,32 +500,53 @@ export async function fetchGdacs(now = new Date(), home = HOME) {
     return { systems: [], ok: false, error: `GDACS event list: ${errText(err)}`, errors: [] };
   }
   const errors = [];
+  let partial = false;
   try {
     const active = events.filter((ev) => isActiveEvent(ev, now));
+    const activeKeys = new Set(active.map((ev) => `${ev.eventId}:${ev.episodeId}`));
+    for (const key of episodeCache.keys()) if (!activeKeys.has(key)) episodeCache.delete(key);
     const systems = await mapLimit(active, MAX_IN_FLIGHT, async (ev) => {
       if (!wantsDetail(ev, home)) return toSystem(ev);
+      const key = `${ev.eventId}:${ev.episodeId}`;
+      const cached = ev.episodeId !== null ? episodeCache.get(key) : null;
+      if (cached) return toSystem(ev, cached.geometry, cached.timeline);
       // Sequential per event so mapLimit's limit is the real in-flight limit.
       let geometry = null;
       let timeline = null;
+      const missing = [];
       try {
         geometry = await fetchJson(geometryUrl(ev), FETCH_OPTS);
+        if (!geometry?.features) missing.push('geometry');
       } catch (err) {
+        missing.push('geometry');
         errors.push(`GDACS geometry ${ev.eventName}: ${errText(err)}`);
       }
       try {
         const url = timelineUrlFrom(await fetchJson(eventDataUrl(ev), FETCH_OPTS), ev.source);
         if (url) timeline = await fetchJson(url, FETCH_OPTS);
+        if (!url) errors.push(`GDACS timeline ${ev.eventName}: no timeline in the event data`);
+        else if (!parseTimeline(timeline).length) errors.push(`GDACS timeline ${ev.eventName}: empty timeline`);
+        if (!url || !parseTimeline(timeline).length) missing.push('timeline');
       } catch (err) {
+        missing.push('timeline');
         errors.push(`GDACS timeline ${ev.eventName}: ${errText(err)}`);
       }
+      if (missing.length && detailMatters(ev, home)) partial = true;
       try {
-        return toSystem(ev, geometry, timeline);
+        const geo = geometry?.features ? parseGeometry(geometry) : null;
+        const tl = timeline ? parseTimeline(timeline) : null;
+        if (!missing.length && ev.episodeId !== null) {
+          episodeCache.set(key, { geometry: geo, timeline: tl });
+          while (episodeCache.size > EPISODE_CACHE_MAX) episodeCache.delete(episodeCache.keys().next().value);
+        }
+        return toSystem(ev, geo, tl);
       } catch (err) {
         errors.push(`GDACS parse ${ev.eventName}: ${errText(err)}`);
+        partial = partial || detailMatters(ev, home);
         return toSystem(ev);
       }
     });
-    return { systems: systems.filter(Boolean), ok: true, errors };
+    return { systems: systems.filter(Boolean), ok: true, partial, errors };
   } catch (err) {
     return { systems: [], ok: false, error: `GDACS: ${errText(err)}`, errors };
   }

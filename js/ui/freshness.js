@@ -7,7 +7,8 @@ import { fill, h } from './dom.js';
 
 /**
  * @param {HTMLElement} el #freshness
- * @param {{now: Date, updatedAt: Date|null, refreshing?: boolean, offline?: boolean, demo?: boolean}} ctx
+ * @param {{now: Date, updatedAt: Date|null, refreshing?: boolean, offline?: boolean, failed?: boolean, demo?: boolean}} ctx
+ *   `updatedAt` = the last refresh that actually reached a source; `failed` = the latest attempt reached none.
  */
 export function renderFreshness(el, ctx = {}) {
   const now = ctx.now ?? new Date();
@@ -23,5 +24,6 @@ export function renderFreshness(el, ctx = {}) {
   );
   if (!isViewerInYangon(now)) parts.push(h('span', { class: 'fresh-local', text: t('fresh.yourTime', { time: formatLocalTime(now) }) }));
   if (ctx.offline) parts.push(h('span', { class: 'fresh-offline', text: t('fresh.offline') }));
+  else if (ctx.failed && ctx.updatedAt) parts.push(h('span', { class: 'fresh-offline', text: t('fresh.failed') }));
   fill(el, parts);
 }

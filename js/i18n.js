@@ -204,8 +204,32 @@ function tidy(s) {
   return s
     .replace(/\(\s*\)/g, '')
     .replace(/\s{2,}/g, ' ')
-    .replace(/\s+([,.;:)])/g, '$1')
+    .replace(/\s+([,.;:)၊။])/g, '$1')
     .trim();
+}
+
+/**
+ * Display name for a storm. JTWC invest areas are named in English by the
+ * parsers ("Invest 92W", "Invest area"); give them the translated label.
+ */
+export function systemName(name, tr = t) {
+  const s = String(name ?? '').trim();
+  const m = /^Invest\s+(\w+)$/i.exec(s);
+  const key = m ? 'sys.investName' : /^Invest area$/i.test(s) ? 'sys.investArea' : null;
+  if (!key) return s;
+  const out = tr(key, m ? { designation: m[1] } : undefined);
+  // A translator that doesn't know the key (e.g. the map's fallback) returns it as is.
+  return out && out !== key ? out : s;
+}
+
+/** List separator for the current language (Burmese uses the ၊ mark). */
+export function listSep() {
+  return lang === 'my' ? '၊ ' : ', ';
+}
+
+/** Sentence end for the current language (Burmese uses the ။ mark). */
+export function sentenceEnd() {
+  return lang === 'my' ? '။' : '.';
 }
 
 /**
@@ -241,7 +265,7 @@ const PARAM_FORMATS = {
   hpa: (v) => formatPressure(v),
   hours: (v) => formatNumber(Math.round(v)),
   time: (v) => formatWhen(v),
-  name: (v) => String(v),
+  name: (v) => systemName(v),
   compass: (v) => compassLabel(v),
   stage: (v) => t(`dmh.stage.${v}`),
   system: (v) => t(`dmh.system.${v}`),
@@ -418,8 +442,8 @@ function toDate(d) {
 
 const BURMESE_DIGITS = '၀၁၂၃၄၅၆၇၈၉';
 
-/** Latin digits → Burmese digits in Burmese mode. */
-function localDigits(str) {
+/** Latin digits → Burmese digits in Burmese mode (display only; tel: links keep Latin digits). */
+export function localDigits(str) {
   return lang === 'my' ? String(str).replace(/[0-9]/g, (c) => BURMESE_DIGITS[c]) : String(str);
 }
 

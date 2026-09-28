@@ -7,6 +7,7 @@
 import { DMH_STAGES, HOME, STALE_AFTER_MS, THRESHOLDS, URLS } from './config.js';
 import { bearingDeg, compass16, haversineKm } from './geo.js';
 import { fetchJson, HttpError } from './net.js';
+import { dmhBulletinReason, inForceDmh } from './risk.js';
 
 const DMH_SYSTEMS = new Set(['low', 'well-marked-low', 'depression', 'deep-depression', 'cs', 'scs', 'vscs', 'escs', 'sucs']);
 const OTHER_TYPES = new Set(['flood', 'flash-flood', 'heavy-rain', 'strong-wind', 'water-level', 'other']);
@@ -15,6 +16,7 @@ const CACHE_BUCKET_MS = 5 * 60 * 1000;
 const FUTURE_TOLERANCE_MS = 6 * 3600e3;
 const RECENT_MAX = 6;
 const OTHER_MAX = 8;
+const UNDATED_MAX = 6;
 
 // ---------------------------------------------------------------------------
 // Sanitizers
@@ -76,6 +78,8 @@ function cleanBulletin(b) {
     number: finite(b.number),
     year: finite(b.year),
     stage: typeof b.stage === 'string' && Object.hasOwn(DMH_STAGES, b.stage) ? b.stage : null,
+    // DMH coded this stage for other regions only (late in a storm, stages go per region).
+    stageScope: b.stageScope === 'other-regions' ? 'other-regions' : null,
     issuedAt: issuedAtDate.toISOString(),
     issuedAtDate,
     lat: validPos ? lat : null,
@@ -84,25 +88,64 @@ function cleanBulletin(b) {
     windMph: cleanWind(b.windMph),
     mentionsYangon: b.mentionsYangon === true,
     weakening: b.weakening === true,
+    final: b.final === true,
+    issuedAtEstimated: b.issuedAtEstimated === true,
     title: pair(b.title, (s) => str(s, 300)),
     url: pair(b.url, safeUrl),
     summary: pair(b.summary, (s) => str(s, 2000)),
   };
 }
 
-/** Add position relative to home, `near` and `isCurrent`. */
-function locate(b, home, now) {
+/**
+ * Add position relative to home, `near` and `isCurrent`. DMH types its post
+ * dates by hand: a date far in the future is a typo, so the bulletin counts
+ * from when our check saw it (`checkedAt`) and is flagged `dateSuspect`
+ * rather than silently dropped.
+ */
+function locate(b, home, now, checkedAt = null) {
   const hasPos = b.lat != null && b.lon != null;
   const distanceKm = hasPos ? haversineKm(home, { lat: b.lat, lon: b.lon }) : null;
   const bearingFromHome = hasPos ? bearingDeg(home, { lat: b.lat, lon: b.lon }) : null;
+  const dateSuspect = b.issuedAtDate.getTime() - now.getTime() > FUTURE_TOLERANCE_MS;
+  const effectiveIssuedDate = dateSuspect ? (checkedAt && checkedAt < b.issuedAtDate ? checkedAt : now) : b.issuedAtDate;
   return {
     ...b,
-    isCurrent: withinHours(b.issuedAtDate, now, THRESHOLDS.dmh.currentHours),
+    effectiveIssuedDate,
+    dateSuspect,
+    isCurrent: withinHours(effectiveIssuedDate, now, THRESHOLDS.dmh.currentHours),
     distanceKm,
     bearingFromHome,
     compassFromHome: bearingFromHome == null ? null : compass16(bearingFromHome),
     near: (distanceKm != null && distanceKm <= THRESHOLDS.dmh.nearKm) || b.mentionsYangon,
   };
+}
+
+/** Rank for choosing which in-force bulletin leads: attention floor, then Warning before News, then newest. */
+function leadOrder(a, b) {
+  const la = dmhBulletinReason(a)?.level ?? -1;
+  const lb = dmhBulletinReason(b)?.level ?? -1;
+  if (la !== lb) return lb - la;
+  const ka = a.kind === 'warning' ? 1 : 0;
+  const kb = b.kind === 'warning' ? 1 : 0;
+  if (ka !== kb) return kb - ka;
+  return (b.effectiveIssuedDate ?? b.issuedAtDate) - (a.effectiveIssuedDate ?? a.issuedAtDate);
+}
+
+/**
+ * Current DMH bulletins still in force (see risk.js `inForceDmh`), each
+ * located, the one to show first leading. Works on raw data/dmh.json
+ * bulletins too (scripts/fetch-dmh.mjs uses it to pick `cyclone`).
+ * @returns {{inForce: object[], lead: object|null}}
+ */
+export function rankDmhBulletins(list, { home = HOME, now = new Date(), checkedAt = null } = {}) {
+  const nowDate = toDate(now) ?? new Date();
+  const located = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const b = raw && raw.issuedAtDate instanceof Date && 'isCurrent' in raw ? raw : cleanBulletin(raw);
+    if (b) located.push({ ...(b.isCurrent === undefined ? locate(b, home, nowDate, checkedAt) : b), _src: raw });
+  }
+  const inForce = inForceDmh(located, nowDate).sort(leadOrder);
+  return { inForce, lead: inForce[0] ?? null };
 }
 
 function cleanAnnouncement(a) {
@@ -155,7 +198,7 @@ export async function fetchDmhJson({ now = Date.now(), ...opts } = {}) {
  * @param {Date} [now]
  */
 export function evaluateDmh(json, home = HOME, now = new Date()) {
-  const empty = { available: false, ok: false, checkedAt: null, attemptedAt: null, checkStale: true, errors: [], bulletin: null, announcement: null, otherWarnings: [], recent: [] };
+  const empty = { available: false, ok: false, partial: false, dateSuspect: false, checkedAt: null, attemptedAt: null, checkStale: true, errors: [], bulletin: null, lead: null, inForce: [], undated: [], announcement: null, otherWarnings: [], recent: [] };
   if (!isObj(json)) return empty;
   const nowDate = toDate(now) ?? new Date();
 
@@ -167,16 +210,31 @@ export function evaluateDmh(json, home = HOME, now = new Date()) {
     .filter(Boolean)
     .sort((a, b) => b.issuedAtDate - a.issuedAtDate)
     .slice(0, RECENT_MAX)
-    .map(({ summary, ...b }) => locate(b, home, nowDate));
+    .map(({ summary, ...b }) => locate(b, home, nowDate, checkedAt));
+  const bulletin = cyclone ? locate(cyclone, home, nowDate, checkedAt) : null;
+  // DMH runs bulletin series for different systems side by side: every one still in force counts.
+  const inForce = inForceDmh([bulletin, ...recent], nowDate)
+    .map((b) => (bulletin && b.id === bulletin.id ? bulletin : b))
+    .sort(leadOrder);
+  // Cyclone bulletins DMH lists that our check could not read (no date): coverage is partial.
+  const undated = (Array.isArray(json.undatedCyclone) ? json.undatedCyclone : [])
+    .filter(isObj)
+    .slice(0, UNDATED_MAX)
+    .map((u) => ({ id: u.id == null ? null : String(u.id).slice(0, 40), kind: u.kind === 'warning' || u.kind === 'news' ? u.kind : null, title: pair(u.title, (x) => str(x, 300)), url: pair(u.url, safeUrl) }));
 
   return {
     available: checkedAt !== null,
     ok: json.ok === true,
+    partial: json.partial === true || undated.length > 0,
+    dateSuspect: inForce.some((b) => b.dateSuspect),
     checkedAt,
     attemptedAt: toDate(json.attemptedAt),
     checkStale: !(age <= STALE_AFTER_MS.dmhCheck),
     errors: (Array.isArray(json.errors) ? json.errors : []).filter((e) => typeof e === 'string').slice(0, 20),
-    bulletin: cyclone ? locate(cyclone, home, nowDate) : null,
+    bulletin,
+    lead: inForce[0] ?? null,
+    inForce,
+    undated,
     announcement: cleanAnnouncement(json.announcement),
     otherWarnings: (Array.isArray(json.otherWarnings) ? json.otherWarnings : [])
       .map((w) => cleanOtherWarning(w, nowDate))

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   buildEventListUrl,
+  clearGdacsCache,
   fetchGdacs,
   isActiveEvent,
   parseEventList,
@@ -222,6 +223,7 @@ afterEach(() => {
 const TIMELINE_URL = 'https://www.gdacs.org/gdacsapi/api/export/gettimeline?id=900001';
 
 function stubFetch(routes) {
+  clearGdacsCache(); // episode detail is cached per module; each test serves its own network
   const calls = [];
   let inFlight = 0;
   let maxInFlight = 0;
@@ -283,7 +285,7 @@ test('fetchGdacs: detail failures still return the system', async () => {
 test('fetchGdacs: 204 → ok with no systems', async () => {
   stubFetch([[/geteventlist/, 204]]);
   const res = await fetchGdacs(NOW, HOME);
-  assert.deepEqual(res, { systems: [], ok: true, errors: [] });
+  assert.deepEqual(res, { systems: [], ok: true, partial: false, errors: [] });
 });
 
 test('fetchGdacs: network failure → ok:false, never throws', async () => {

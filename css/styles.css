@@ -549,6 +549,13 @@ details[open] > summary::before {
   outline-offset: -3px;
 }
 
+/* The pressed button is filled with the accent colour: a contrasting inner ring shows focus. */
+.seg button[aria-pressed='true']:focus-visible {
+  outline-color: var(--accent-ink);
+  outline-offset: -5px;
+  border-radius: 0;
+}
+
 .ctl-btn {
   display: inline-flex;
   align-items: center;
@@ -585,7 +592,7 @@ details[open] > summary::before {
   display: flex;
   flex-wrap: wrap;
   gap: 2px 0;
-  font-size: 0.875rem;
+  font-size: 1rem;
   color: var(--ink-2);
   min-width: 0;
 }
@@ -647,6 +654,22 @@ details[open] > summary::before {
 
 .chipnav ul::-webkit-scrollbar {
   display: none;
+}
+
+/* More chips off to the side: fade that edge (set by main.js). */
+.chipnav ul.more-right {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 40px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 40px), transparent);
+}
+
+.chipnav ul.more-left {
+  -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 40px), transparent);
+  mask-image: linear-gradient(to left, #000 calc(100% - 40px), transparent);
+}
+
+.chipnav ul.more-left.more-right {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 40px, #000 calc(100% - 40px), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 40px, #000 calc(100% - 40px), transparent);
 }
 
 .chipnav li {
@@ -842,7 +865,7 @@ details[open] > summary::before {
   gap: 8px;
   align-items: flex-start;
   color: var(--ink);
-  font-size: 0.9375rem;
+  font-size: 1rem;
 }
 
 .status-gaps .icon,
@@ -866,7 +889,7 @@ details[open] > summary::before {
 
 .status-smallprint {
   margin: 0;
-  font-size: 0.875rem;
+  font-size: 1rem;
   color: var(--ink-2);
 }
 
@@ -1044,7 +1067,7 @@ details[open] > summary::before {
 }
 
 .other-list li {
-  padding: 6px 0;
+  padding: 2px 0;
   border-top: 1px solid var(--border);
 }
 
@@ -1085,8 +1108,23 @@ details[open] > summary::before {
 .official-links {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 20px;
+  gap: 0 20px;
   margin: 12px 0 0;
+}
+
+/* Links that stand alone (not inside running text) are 44 px tap targets. */
+.official-links a,
+.sys-actions a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+}
+
+.other-list li > a.link-ext,
+.dmh-recent li > a.link-ext,
+.source-list li > a.link-ext {
+  display: inline-block;
+  padding-block: 10px;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1261,6 +1299,13 @@ details[open] > summary::before {
   }
   .tile-value {
     font-size: 1.375rem;
+  }
+}
+
+/* 320 px (or zoomed in): two tiles side by side would clip "Temperature". */
+@media (max-width: 359px) {
+  .tiles {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -1550,6 +1595,10 @@ details[open] > summary::before {
   overflow: auto;
   border: 1px solid var(--border);
   border-radius: 10px;
+}
+
+.table-scroll:focus-visible {
+  outline-offset: 2px;
 }
 
 .hc-table-el {
@@ -1928,6 +1977,7 @@ details[open] > summary::before {
   .level-table td {
     display: block;
     width: auto;
+    min-width: 0;
   }
   .level-table thead {
     display: none;
@@ -1946,6 +1996,15 @@ details[open] > summary::before {
 
 .disclaimer {
   font-weight: 600;
+}
+
+.check-undo {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 4px 0 0;
 }
 
 .demo-links {
