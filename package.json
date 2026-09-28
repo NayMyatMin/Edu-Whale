@@ -1,0 +1,13 @@
+{
+  "name": "yangon-storm-watch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Static storm tracker for Yangon, Myanmar (DMH, JTWC, GDACS, Open-Meteo).",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test tests/",
+    "fetch:dmh": "node scripts/fetch-dmh.mjs --out data/dmh.json",
+    "serve": "npx --yes http-server -p 8080 -c-1 ."
+  }
+}
